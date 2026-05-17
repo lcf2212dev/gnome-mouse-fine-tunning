@@ -698,9 +698,10 @@ class PresetsPage:
 
         self.preview.set_curve(preset["curve"])
 
-        # Auto-apply: ao trocar de preset, re-aplica a curva nova no(s) mouse(s) em uso
-        if previous != preset["name"]:
-            self.schedule_auto_apply()
+        # Auto-apply DESLIGADO temporariamente (bug travava o mouse).
+        # if previous != preset["name"]:
+        #     self.schedule_auto_apply()
+        _ = previous  # noqa
 
     # ----- editing -----
 
@@ -920,41 +921,16 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
 
         # Limpa mouses ausentes/históricos do devices.json antes de tudo
         self.cleanup_devices_config()
-        # Sinaliza o daemon pra recarregar (caso cleanup tenha removido devices)
-        daemon_reload()
-
-        # Aceleração nativa: garantir 'adaptive' como fallback quando a curva
-        # customizada não estiver ativa. Não sobrescreve se o usuário tinha
-        # outro valor explícito (flat ou adaptive já configurado).
-        if self.settings.get_string("accel-profile") == "default":
-            self.settings.set_string("accel-profile", "adaptive")
 
         self._build_ui()
         self._install_actions()
         self.refresh_all()
         GLib.timeout_add_seconds(3, self._periodic_tick)
 
-        # Auto-aplica preset ao mouse em uso no boot (oculto ao usuário)
-        self.presets_page.schedule_auto_apply()
-        # Re-detecta periodicamente caso o user comece a mexer outro mouse
-        GLib.timeout_add_seconds(8, self._periodic_redetect)
-
-    def _periodic_redetect(self) -> bool:
-        """A cada 8s, faz um probe leve pra detectar mouses novos.
-        Se o conjunto de mouses em uso mudou, re-aplica o preset (auto-adapta).
-        Devices já interceptados pelo daemon não vão acusar evento no probe
-        (grab exclusivo), então o conjunto efetivo = ativos no daemon ∪ probed."""
-        def worker():
-            probed = mft_common.probe_mouse_activity(timeout=0.4)
-            new_movers = {did for did, in_use in probed.items() if in_use}
-            current = set(self.daemon_active_devices)
-            new_in_use = current | new_movers
-            if new_in_use and new_in_use != current:
-                preset = self.active_preset_name
-                if preset:
-                    GLib.idle_add(self.apply_preset_to_in_use, preset, new_in_use)
-        threading.Thread(target=worker, daemon=True).start()
-        return GLib.SOURCE_CONTINUE
+        # AUTO-APPLY DESLIGADO temporariamente — bug travava o mouse físico
+        # ao fazer grab+re-emit. O app abre como visualizador (edita presets
+        # mas NÃO inicia o daemon nem força flat). Para ativar manualmente,
+        # rode:  systemctl --user enable --now mouse-curve-daemon.service
 
     # ----- presets/devices state -----
 
