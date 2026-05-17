@@ -382,6 +382,26 @@ def find_device(config: dict, device_id: str) -> dict | None:
     return None
 
 
+def get_saved_speed(config: dict) -> float | None:
+    """Retorna o gsettings 'speed' salvo antes da curva customizada ativar.
+    None se não houve save (modo Adaptativa)."""
+    v = config.get("saved_native_speed")
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def set_saved_speed(config: dict, value: float | None) -> None:
+    """Salva (ou limpa) o gsettings 'speed' original no devices.json."""
+    if value is None:
+        config.pop("saved_native_speed", None)
+    else:
+        config["saved_native_speed"] = float(value)
+
+
 def _migrate_legacy_curve_config() -> dict | None:
     """Migra ~/.config/.../curve.json (v0.2) para devices.json (v0.3+).
     Cria um preset custom 'Migrated' com os parâmetros e atribui ao primeiro device."""

@@ -1155,16 +1155,37 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
     def apply_preset_to_in_use(self, preset_name: str, in_use_ids: set[str]) -> int:
         """Aplica preset aos mouses em uso.
 
-        Comportamento especial para o preset 'Adaptativa' (sistema padrão):
-        nenhum mouse é interceptado (daemon não faz grab) e accel-profile
-        volta a 'adaptive'. O GNOME aplica sua própria aceleração natural.
+        Quando curva customizada é ativada (preset != Adaptativa), o app:
+          - Salva o `gsettings speed` atual em `saved_native_speed` (se ainda
+            não estava salvo) — só na transição Adaptativa → custom.
+          - Força `speed = 0.0` (neutro) pra que o multiplicador do compositor
+            não amplifique/atenue a curva customizada.
+          - Força `accel-profile = flat` — só a curva customizada age.
+
+        Quando volta pra Adaptativa:
+          - Restaura `speed` salvo (se houver).
+          - Limpa o campo `saved_native_speed` no devices.json.
+          - `accel-profile = adaptive` (GNOME volta a aplicar curva nativa).
         """
+        cfg = mft_common.load_devices_config()
+
         if mft_common.is_system_default(preset_name):
             self.disable_curve_everywhere()
+            # restaura speed se houver valor salvo
+            saved = mft_common.get_saved_speed(cfg)
+            if saved is not None:
+                self.settings.set_double("speed", saved)
+                mft_common.set_saved_speed(cfg, None)
+                mft_common.save_devices_config(cfg)
             self.settings.set_string("accel-profile", "adaptive")
             return 0
 
-        cfg = mft_common.load_devices_config()
+        # Curva customizada: salvar speed atual (se ainda não salvo) e forçar 0
+        if mft_common.get_saved_speed(cfg) is None:
+            current_speed = self.settings.get_double("speed")
+            mft_common.set_saved_speed(cfg, current_speed)
+        self.settings.set_double("speed", 0.0)
+
         present = {m["id"]: m["name"] for m in mft_common.enumerate_present_mice()}
         for did in in_use_ids:
             if did in present:
@@ -1178,7 +1199,6 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
             else:
                 d["enabled"] = False
         mft_common.save_devices_config(cfg)
-        # curva customizada substitui aceleração nativa
         self.settings.set_string("accel-profile", "flat")
         daemon_reload()
         return n

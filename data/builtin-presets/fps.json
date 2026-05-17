@@ -1,13 +1,13 @@
 {
   "name": "FPS",
-  "description": "Para jogos de tiro: precisão em micro-ajustes + aceleração agressiva em flicks rápidos.",
+  "description": "Pra jogos de tiro: micro-ajustes precisos em mira lenta + aceleração agressiva em flicks rápidos. Dead-zone de 30 px/s evita tremor.",
   "builtin": true,
   "order": 2,
   "curve": {
-    "sensitivity": 0.8,
-    "gain": 1.0,
-    "power": 1.8,
-    "deadzone": 50.0,
-    "max_multiplier": 4.0
+    "sensitivity": 0.7,
+    "gain": 2.5,
+    "power": 1.7,
+    "deadzone": 30.0,
+    "max_multiplier": 5.0
   }
 }

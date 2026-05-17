@@ -1,13 +1,13 @@
 {
   "name": "Linear",
-  "description": "Sem aceleração — movimento 1:1, multiplicador constante.",
+  "description": "Feel natural — emula a aceleração adaptive do GNOME quando o daemon está interceptando. Bom ponto de partida pra usar a curva customizada sem mudar drasticamente o comportamento.",
   "builtin": true,
   "order": 0,
   "curve": {
-    "sensitivity": 1.0,
-    "gain": 0.0,
+    "sensitivity": 0.7,
+    "gain": 1.0,
     "power": 1.0,
     "deadzone": 0.0,
-    "max_multiplier": 1.0
+    "max_multiplier": 2.5
   }
 }
