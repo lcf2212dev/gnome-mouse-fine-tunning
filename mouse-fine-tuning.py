@@ -501,306 +501,6 @@ class BasicPage:
             self.settings.set_string("accel-profile", new)
 
 
-class DevicesPage:
-    """Aba 'Dispositivos' — lista mouses em uso (com probe), switch on/off, dropdown preset."""
-
-    def __init__(self, window: MouseFineTuningWindow) -> None:
-        self.window = window
-        self.page = Adw.PreferencesPage()
-        self._device_widgets: dict[str, dict] = {}
-        self._added_groups: list[Adw.PreferencesGroup] = []
-        self._daemon_status_row = None
-        self._daemon_switch = None
-        self._inactive_switch = None
-        self._suppressing = False
-        # estado do probe
-        self.show_inactive = False
-        self.probed_activity: dict[str, bool] | None = None
-        self.probe_in_progress = False
-        self.rebuild()
-        self.start_probe()
-
-    def start_probe(self) -> None:
-        if self.probe_in_progress:
-            return
-        self.probe_in_progress = True
-        self.probed_activity = None
-        self.rebuild()
-
-        def worker():
-            result = mft_common.probe_mouse_activity(timeout=1.5)
-            # devices que o daemon já intercepta contam como "em uso"
-            for did in self.window.daemon_active_devices:
-                result[did] = True
-            GLib.idle_add(self._on_probe_done, result)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_probe_done(self, result: dict[str, bool]) -> bool:
-        self.probe_in_progress = False
-        self.probed_activity = result
-        self.rebuild()
-        return False
-
-    def rebuild(self) -> None:
-        # remover grupos previamente adicionados
-        for g in self._added_groups:
-            try:
-                self.page.remove(g)
-            except (ValueError, TypeError):
-                pass
-        self._added_groups.clear()
-        self._device_widgets.clear()
-
-        # ---- status group ----
-        status_group = Adw.PreferencesGroup(
-            title="Curva customizada",
-            description=(
-                "O daemon mouse-curve-daemon intercepta os mouses habilitados e "
-                "aplica a curva do preset escolhido."
-            ),
-        )
-        self._daemon_switch = Adw.SwitchRow(
-            title="Daemon ativo",
-            subtitle="Liga/desliga o serviço; também inicia/para automaticamente no login.",
-        )
-        self._daemon_switch.connect("notify::active", self._on_daemon_toggle)
-        status_group.add(self._daemon_switch)
-
-        self._daemon_status_row = Adw.ActionRow(title="Status", subtitle="—")
-        redetect_btn = Gtk.Button(
-            label="Re-detectar",
-            valign=Gtk.Align.CENTER,
-            tooltip_text="Re-escanear mouses e probar atividade (~1.5 s — mexa o mouse durante)",
-        )
-        redetect_btn.add_css_class("flat")
-        redetect_btn.connect("clicked", lambda *_: self.start_probe())
-        self._daemon_status_row.add_suffix(redetect_btn)
-        status_group.add(self._daemon_status_row)
-
-        self._inactive_switch = Adw.SwitchRow(
-            title="Mostrar mouses sem atividade",
-            subtitle="Lista também dispositivos detectados mas não em uso agora.",
-        )
-        self._inactive_switch.set_active(self.show_inactive)
-        self._inactive_switch.connect("notify::active", self._on_inactive_toggle)
-        status_group.add(self._inactive_switch)
-        self._add_group(status_group)
-
-        # ---- placeholder durante probe ----
-        if self.probe_in_progress and self.probed_activity is None:
-            probing = Adw.PreferencesGroup(
-                title="Detectando mouses em uso…",
-                description="Mexa o mouse que você quer configurar (até 1.5 s).",
-            )
-            self._add_group(probing)
-            self.refresh_status()
-            return
-
-        # ---- lista de devices ----
-        all_devices = self.window.list_devices_with_config()
-        for entry in all_devices:
-            in_daemon = entry["id"] in self.window.daemon_active_devices
-            probed = (self.probed_activity or {}).get(entry["id"], False)
-            entry["in_use"] = in_daemon or probed
-
-        if self.show_inactive:
-            visible = all_devices
-        else:
-            visible = [
-                d for d in all_devices
-                if d["in_use"] or d.get("config", {}).get("enabled")
-            ]
-        hidden_count = len(all_devices) - len(visible)
-
-        if not visible:
-            empty = Adw.PreferencesGroup(
-                title="Nenhum mouse em uso detectado",
-                description=(
-                    f"Detectei {len(all_devices)} mouse(s) presente(s), mas nenhum gerou "
-                    "movimento. Mexa o mouse e clique em Re-detectar, ou ative "
-                    "“Mostrar mouses sem atividade”."
-                ),
-            )
-            self._add_group(empty)
-        else:
-            for entry in visible:
-                self._add_group(self._build_device_group(entry))
-
-        if hidden_count > 0 and not self.show_inactive:
-            hint = Adw.PreferencesGroup(
-                title="",
-                description=(
-                    f"{hidden_count} mouse(s) sem atividade ocultos. "
-                    "Ative “Mostrar mouses sem atividade” acima pra ver."
-                ),
-            )
-            self._add_group(hint)
-
-        self.refresh_status()
-
-    def _on_inactive_toggle(self, switch, _pspec) -> None:
-        if self._suppressing:
-            return
-        self.show_inactive = switch.get_active()
-        self.rebuild()
-
-    def _add_group(self, g: Adw.PreferencesGroup) -> None:
-        self.page.add(g)
-        self._added_groups.append(g)
-
-    def _build_device_group(self, entry: dict) -> Adw.PreferencesGroup:
-        present = entry.get("present", False)
-        config_entry = entry.get("config", {})
-        display_name = entry.get("name") or config_entry.get("name", "(sem nome)")
-        in_use = entry.get("in_use", False)
-        enabled = bool(config_entry.get("enabled", False))
-
-        sub = f"ID {entry['id']}"
-        if not present:
-            sub += " · desconectado"
-        elif in_use and enabled:
-            sub += " · em uso · curva aplicada"
-        elif in_use:
-            sub += " · em uso · curva desligada"
-        elif enabled:
-            sub += " · habilitado, sem movimento detectado"
-        else:
-            sub += " · presente, parado"
-
-        group = Adw.PreferencesGroup(title=display_name, description=sub)
-
-        switch = Adw.SwitchRow(
-            title="Aceleração customizada",
-            subtitle="Aplica curva do preset selecionado",
-        )
-        switch.set_active(bool(config_entry.get("enabled", False)))
-        switch.set_sensitive(present)
-        switch.connect("notify::active", self._on_device_switch, entry["id"])
-        group.add(switch)
-
-        combo = Adw.ComboRow(title="Preset")
-        preset_names = [p["name"] for p in self.window.presets]
-        combo.set_model(Gtk.StringList.new(preset_names))
-        current_preset = config_entry.get("preset", "Linear")
-        if current_preset in preset_names:
-            combo.set_selected(preset_names.index(current_preset))
-        combo.connect("notify::selected", self._on_device_preset, entry["id"])
-        group.add(combo)
-
-        self._device_widgets[entry["id"]] = {
-            "switch": switch,
-            "combo": combo,
-            "group": group,
-        }
-        return group
-
-    def _on_device_switch(self, switch, _pspec, device_id) -> None:
-        if self._suppressing:
-            return
-        cfg = mft_common.load_devices_config()
-        entry = mft_common.find_device(cfg, device_id)
-        if not entry:
-            # adicionar baseado no presente
-            for d in self.window.list_devices_with_config():
-                if d["id"] == device_id:
-                    mft_common.upsert_device(
-                        cfg,
-                        device_id,
-                        d["name"],
-                        preset="Linear",
-                        enabled=switch.get_active(),
-                    )
-                    break
-        else:
-            entry["enabled"] = switch.get_active()
-        mft_common.save_devices_config(cfg)
-        # se ligou algum mouse, ativar accel-profile=flat e o daemon
-        if switch.get_active():
-            self.window.settings.set_string("accel-profile", "flat")
-            if not daemon_active():
-                daemon_start()
-        else:
-            daemon_reload()  # notifica daemon pra fechar o handler do mouse
-        GLib.timeout_add(300, self.window.refresh_all_and_continue)
-
-    def _on_device_preset(self, combo, _pspec, device_id) -> None:
-        if self._suppressing:
-            return
-        idx = combo.get_selected()
-        names = [p["name"] for p in self.window.presets]
-        if idx >= len(names):
-            return
-        preset = names[idx]
-        cfg = mft_common.load_devices_config()
-        entry = mft_common.find_device(cfg, device_id)
-        if not entry:
-            for d in self.window.list_devices_with_config():
-                if d["id"] == device_id:
-                    mft_common.upsert_device(
-                        cfg, device_id, d["name"], preset=preset, enabled=False
-                    )
-                    break
-        else:
-            entry["preset"] = preset
-        mft_common.save_devices_config(cfg)
-        daemon_reload()
-
-    def _on_daemon_toggle(self, switch, _pspec) -> None:
-        if self._suppressing:
-            return
-        if switch.get_active():
-            if not daemon_unit_exists():
-                self._set_status("Unit systemd ausente. Rode setup.sh primeiro.", warn=True)
-                switch.set_active(False)
-                return
-            ok, msg = daemon_start()
-            if not ok:
-                self._set_status(f"Falha ao iniciar: {msg}", warn=True)
-                switch.set_active(False)
-        else:
-            ok, msg = daemon_stop()
-            if not ok and "not loaded" not in msg.lower():
-                self._set_status(f"Falha ao parar: {msg}", warn=True)
-        GLib.timeout_add(300, self.window.refresh_all_and_continue)
-
-    def _set_status(self, text: str, warn: bool = False) -> None:
-        if not self._daemon_status_row:
-            return
-        self._daemon_status_row.set_subtitle(text)
-        if warn:
-            self._daemon_status_row.add_css_class("warning")
-        else:
-            self._daemon_status_row.remove_css_class("warning")
-
-    def refresh_status(self) -> None:
-        if not self._daemon_status_row or not self._daemon_switch:
-            return
-        if not daemon_unit_exists():
-            self._set_status("Unit systemd não instalada (rode `./setup.sh install`)", warn=True)
-            self._daemon_switch.set_sensitive(False)
-            return
-        self._daemon_switch.set_sensitive(True)
-
-        active = daemon_active()
-        enabled = daemon_enabled()
-        n_enabled = sum(1 for d in mft_common.load_devices_config().get("devices", []) if d.get("enabled"))
-        if active and enabled:
-            self._set_status(f"Ativo e habilitado no login · {n_enabled} mouse(s) habilitado(s)")
-        elif active:
-            self._set_status(f"Ativo (não inicia no login) · {n_enabled} mouse(s) habilitado(s)")
-        elif enabled:
-            self._set_status("Habilitado no login mas inativo agora")
-        else:
-            self._set_status("Parado")
-
-        self._suppressing = True
-        try:
-            self._daemon_switch.set_active(active)
-        finally:
-            self._suppressing = False
-
-
 class PresetsPage:
     """Aba 'Presets' — editor + preview + live monitor."""
 
@@ -900,6 +600,35 @@ class PresetsPage:
         preview_group.add(host)
         self.page.add(preview_group)
 
+        # ----- grupo: aplicação ao mouse em uso -----
+        apply_group = Adw.PreferencesGroup(
+            title="Aplicação",
+            description=(
+                "Liga o switch pra aplicar este preset ao(s) seu(s) mouse(s) "
+                "ativo(s) no momento. O sistema detecta automaticamente."
+            ),
+        )
+        self.apply_status_row = Adw.ActionRow(
+            title="Mouse em uso", subtitle="—"
+        )
+        redetect_btn = Gtk.Button(
+            label="Re-detectar",
+            valign=Gtk.Align.CENTER,
+            tooltip_text="Probar atividade do mouse novamente (~1.5s — mexa o mouse)",
+        )
+        redetect_btn.add_css_class("flat")
+        redetect_btn.connect("clicked", self._on_redetect_clicked)
+        self.apply_status_row.add_suffix(redetect_btn)
+        apply_group.add(self.apply_status_row)
+
+        self.apply_switch = Adw.SwitchRow(
+            title="Aplicar curva no meu mouse",
+            subtitle="Ativa o daemon e aplica este preset ao(s) mouse(s) em uso.",
+        )
+        self.apply_switch.connect("notify::active", self._on_apply_toggle)
+        apply_group.add(self.apply_switch)
+        self.page.add(apply_group)
+
         # ----- grupo: live monitor -----
         live_group = Adw.PreferencesGroup(
             title="Live monitor (osciloscópio)",
@@ -915,10 +644,6 @@ class PresetsPage:
         self.live_toggle.connect("notify::active", self._on_live_toggle)
         live_group.add(self.live_toggle)
 
-        self.live_device_combo = Adw.ComboRow(title="Monitorar mouse")
-        self.live_device_combo.connect("notify::selected", self._on_live_device)
-        live_group.add(self.live_device_combo)
-
         self.live_monitor = LiveMonitor()
         live_host = Adw.PreferencesRow()
         live_host.set_activatable(False)
@@ -929,6 +654,7 @@ class PresetsPage:
         self.page.add(live_group)
 
         self._live_devices: list[dict] = []
+        self._in_use_ids: set[str] = set()
         self.rebuild_preset_list()
 
     # ----- preset list -----
@@ -958,6 +684,7 @@ class PresetsPage:
         preset = self._current_preset()
         if not preset:
             return
+        previous = self.window.active_preset_name
         self.window.active_preset_name = preset["name"]
         is_builtin = preset["builtin"]
 
@@ -980,6 +707,12 @@ class PresetsPage:
             self._suppressing = False
 
         self.preview.set_curve(preset["curve"])
+
+        # Se switch "Aplicar" estiver ligado e mudou o preset, re-aplicar
+        if previous != preset["name"] and self.apply_switch.get_active():
+            in_use = self._in_use_ids or set(self.window.daemon_active_devices)
+            if in_use:
+                self.window.apply_preset_to_in_use(preset["name"], in_use)
 
     # ----- editing -----
 
@@ -1091,25 +824,99 @@ class PresetsPage:
         dlg.connect("response", on_response)
         dlg.present(self.window)
 
-    # ----- live monitor -----
+    # ----- aplicação / detecção -----
 
     def update_devices(self, devices: list[dict]) -> None:
+        """Recebe lista do daemon via IPC. Atualiza estado do switch e status row."""
         self._live_devices = [d for d in devices if d.get("present")]
-        labels = [d["name"] for d in self._live_devices] or ["(nenhum mouse presente)"]
+        self.refresh_apply_status()
+
+    def refresh_apply_status(self) -> None:
+        """Atualiza Mouse-em-uso row e estado do switch Aplicar baseado no daemon."""
+        # mouse(s) em uso = ativos no daemon ∪ probed_activity
+        in_use = set(self.window.daemon_active_devices)
+        # se nada ativo no daemon, exibe nomes só dos presentes
+        present_by_id = {d["id"]: d["name"] for d in self._live_devices}
+
+        if in_use:
+            self._in_use_ids = in_use
+            names = [present_by_id.get(d, d) for d in sorted(in_use)]
+            self.apply_status_row.set_subtitle(", ".join(names))
+        elif present_by_id:
+            self._in_use_ids = set()
+            self.apply_status_row.set_subtitle(
+                "nenhum movimento detectado · "
+                + ", ".join(present_by_id.values())
+                + " (mexa o mouse e clique Re-detectar)"
+            )
+        else:
+            self._in_use_ids = set()
+            self.apply_status_row.set_subtitle("(nenhum mouse presente)")
+
+        # Switch reflete estado do daemon
         self._suppressing = True
         try:
-            self.live_device_combo.set_model(Gtk.StringList.new(labels))
-            self.live_device_combo.set_sensitive(bool(self._live_devices))
-            if self._live_devices:
-                self.live_device_combo.set_selected(0)
+            self.apply_switch.set_active(bool(in_use))
         finally:
             self._suppressing = False
 
-    def _selected_live_device_id(self) -> str | None:
-        idx = self.live_device_combo.get_selected()
-        if 0 <= idx < len(self._live_devices):
-            return self._live_devices[idx]["id"]
-        return None
+    def _on_redetect_clicked(self, _btn) -> None:
+        # Probe síncrono curto (1.5s). Pode bloquear UI brevemente — aceitável.
+        in_use = self.window.detect_in_use_now(timeout=1.5)
+        # Se o switch estava on, aplica o preset novo aos mouses recém-detectados
+        if self.apply_switch.get_active():
+            preset = self._current_preset()
+            if preset:
+                self.window.apply_preset_to_in_use(preset["name"], in_use)
+        else:
+            # Só atualiza display
+            self._in_use_ids = in_use
+            self.refresh_apply_status()
+        # Solicita nova lista do daemon (ele vai refletir as mudanças)
+        if self.window.ipc.connected:
+            self.window.ipc.request_device_list()
+
+    def _on_apply_toggle(self, switch, _pspec) -> None:
+        if self._suppressing:
+            return
+        if switch.get_active():
+            preset = self._current_preset()
+            if not preset:
+                switch.set_active(False)
+                return
+            if not daemon_unit_exists():
+                self.window.toast("Daemon não instalado — rode ./setup.sh install")
+                self._suppressing = True
+                try:
+                    switch.set_active(False)
+                finally:
+                    self._suppressing = False
+                return
+            # Garantir daemon iniciado
+            if not daemon_active():
+                daemon_start()
+            # Probe síncrono pra detectar mouses em uso
+            in_use = self.window.detect_in_use_now(timeout=1.5)
+            if not in_use:
+                self.window.toast(
+                    "Nenhum mouse em movimento detectado. Mexa o mouse e tente de novo."
+                )
+                self._suppressing = True
+                try:
+                    switch.set_active(False)
+                finally:
+                    self._suppressing = False
+                return
+            n = self.window.apply_preset_to_in_use(preset["name"], in_use)
+            self.window.toast(
+                f"Curva “{preset['name']}” aplicada a {n} mouse(s)."
+            )
+        else:
+            self.window.disable_curve_everywhere()
+        if self.window.ipc.connected:
+            self.window.ipc.request_device_list()
+
+    # ----- live monitor -----
 
     def _on_live_toggle(self, switch, _pspec) -> None:
         if switch.get_active():
@@ -1119,30 +926,18 @@ class PresetsPage:
                     self.window.toast("Daemon não responde — está rodando?")
                     switch.set_active(False)
                     return
-            did = self._selected_live_device_id()
-            if did:
-                self.window.ipc.subscribe(did)
+            # Subscribe a "todos" — só recebe eventos dos mouses em uso de qualquer jeito
+            self.window.ipc.subscribe("*")
             self.live_monitor.set_active(True)
         else:
             if self.window.ipc.connected:
                 self.window.ipc.unsubscribe()
             self.live_monitor.set_active(False)
 
-    def _on_live_device(self, _combo, _pspec) -> None:
-        if self._suppressing:
-            return
-        if self.live_toggle.get_active() and self.window.ipc.connected:
-            did = self._selected_live_device_id()
-            if did:
-                self.window.ipc.subscribe(did)
-                self.live_monitor.reset()
-
     def receive_event(self, msg: dict) -> None:
         if not self.live_monitor.active:
             return
-        did = self._selected_live_device_id()
-        if did and msg.get("device_id") != did:
-            return
+        # Aceita eventos de qualquer mouse em uso
         self.live_monitor.add_sample(
             msg.get("t", time.monotonic()),
             msg.get("speed_in", 0.0),
@@ -1182,6 +977,11 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
 
         mft_common.sync_builtin_presets()
         self.reload_presets()
+
+        # Limpa mouses ausentes/históricos do devices.json antes de tudo
+        self.cleanup_devices_config()
+        # Sinaliza o daemon pra recarregar (caso cleanup tenha removido devices)
+        daemon_reload()
 
         self._build_ui()
         self._install_actions()
@@ -1242,13 +1042,9 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
 
         self.view_stack = Adw.ViewStack()
         self.basic_page = BasicPage(self.settings)
-        self.devices_page = DevicesPage(self)
         self.presets_page = PresetsPage(self)
         self.view_stack.add_titled_with_icon(
             self.basic_page.page, "basic", "Configurações", "input-mouse-symbolic"
-        )
-        self.view_stack.add_titled_with_icon(
-            self.devices_page.page, "devices", "Dispositivos", "drive-removable-media-symbolic"
         )
         self.view_stack.add_titled_with_icon(
             self.presets_page.page, "presets", "Presets", "preferences-other-symbolic"
@@ -1275,13 +1071,8 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
 
     def _on_ipc_device_list(self, msg: dict) -> bool:
         devices = msg.get("devices", [])
-        new_active = {d["id"] for d in devices if d.get("active")}
-        old_active = self.daemon_active_devices
-        self.daemon_active_devices = new_active
+        self.daemon_active_devices = {d["id"] for d in devices if d.get("active")}
         self.presets_page.update_devices(devices)
-        if new_active != old_active and hasattr(self, "devices_page"):
-            # estado do daemon mudou — re-renderizar lista
-            self.devices_page.rebuild()
         return False
 
     def _on_ipc_connect_changed(self, connected: bool) -> bool:
@@ -1324,20 +1115,67 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
         self._toast_overlay.add_toast(Adw.Toast.new(text))
 
     def refresh_all(self) -> None:
-        self.devices_page.rebuild()
+        self.presets_page.refresh_apply_status()
         if self.ipc.connected:
             self.ipc.request_device_list()
 
-    def refresh_all_and_continue(self) -> bool:
-        self.refresh_all()
-        return GLib.SOURCE_REMOVE
-
     def _periodic_tick(self) -> bool:
-        # status do daemon + reconnect IPC se daemon ficou ativo agora
-        self.devices_page.refresh_status()
+        # reconectar IPC se daemon ficou ativo agora; refrescar status
+        self.presets_page.refresh_apply_status()
         if not self.ipc.connected and daemon_active():
             self.ipc.connect()
         return GLib.SOURCE_CONTINUE
+
+    # ----- aplicação automática ao mouse em uso -----
+
+    def cleanup_devices_config(self) -> None:
+        """Remove de devices.json qualquer mouse não presente no momento."""
+        cfg = mft_common.load_devices_config()
+        present_ids = {m["id"] for m in mft_common.enumerate_present_mice()}
+        before = len(cfg.get("devices", []))
+        cfg["devices"] = [d for d in cfg.get("devices", []) if d["id"] in present_ids]
+        if len(cfg["devices"]) != before:
+            mft_common.save_devices_config(cfg)
+
+    def detect_in_use_now(self, timeout: float = 1.5) -> set[str]:
+        """Combina probe direto + IDs já interceptados pelo daemon."""
+        result = set(self.daemon_active_devices)
+        probe = mft_common.probe_mouse_activity(timeout=timeout)
+        for did, in_use in probe.items():
+            if in_use:
+                result.add(did)
+        return result
+
+    def apply_preset_to_in_use(self, preset_name: str, in_use_ids: set[str]) -> int:
+        """Marca enabled=true + preset=preset_name nos mouses em uso;
+        marca enabled=false nos demais. Retorna quantos foram habilitados."""
+        cfg = mft_common.load_devices_config()
+        # garantir que todos os in_use estão na config
+        present = {m["id"]: m["name"] for m in mft_common.enumerate_present_mice()}
+        for did in in_use_ids:
+            if did in present:
+                mft_common.upsert_device(cfg, did, present[did])
+        # aplicar
+        n = 0
+        for d in cfg.get("devices", []):
+            if d["id"] in in_use_ids:
+                d["enabled"] = True
+                d["preset"] = preset_name
+                n += 1
+            else:
+                d["enabled"] = False
+        mft_common.save_devices_config(cfg)
+        # forçar accel-profile=flat
+        self.settings.set_string("accel-profile", "flat")
+        daemon_reload()
+        return n
+
+    def disable_curve_everywhere(self) -> None:
+        cfg = mft_common.load_devices_config()
+        for d in cfg.get("devices", []):
+            d["enabled"] = False
+        mft_common.save_devices_config(cfg)
+        daemon_reload()
 
 
 class MissingSchemaWindow(Adw.ApplicationWindow):

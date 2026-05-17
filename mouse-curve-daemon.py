@@ -51,36 +51,17 @@ def log(msg: str) -> None:
 
 
 # ---------- enumeração de mouses ----------
+# (usar mft_common.enumerate_present_mice — ela já filtra virtuais nossos)
 
 
 def looks_like_mouse(dev: evdev.InputDevice) -> bool:
-    caps = dev.capabilities()
-    if ec.EV_REL not in caps:
-        return False
-    rels = caps[ec.EV_REL]
-    if ec.REL_X not in rels or ec.REL_Y not in rels:
-        return False
-    if ec.EV_ABS in caps:
-        return False
-    keys = caps.get(ec.EV_KEY, [])
-    return ec.BTN_LEFT in keys or ec.BTN_MOUSE in keys
+    """Wrapper que reusa o filtro central."""
+    return mft_common._is_mouselike(dev)
 
 
 def enumerate_present_mice() -> list[tuple[str, str, str]]:
-    """Retorna lista [(device_id, name, path), ...] de mouses físicos."""
-    result = []
-    for path in evdev.list_devices():
-        try:
-            dev = evdev.InputDevice(path)
-        except OSError:
-            continue
-        try:
-            if looks_like_mouse(dev):
-                did = mft_common.device_id_from_evdev(dev)
-                result.append((did, dev.name, path))
-        finally:
-            dev.close()
-    return result
+    """[(device_id, name, path), ...] dos mouses reais (não virtuais)."""
+    return [(d["id"], d["name"], d["path"]) for d in mft_common.enumerate_present_mice()]
 
 
 # ---------- handler de um device ----------

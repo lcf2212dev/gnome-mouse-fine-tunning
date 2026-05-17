@@ -5,8 +5,9 @@ Aplicativo GTK4 + libadwaita para Manjaro/GNOME que combina:
 1. **Configurações nativas do mouse** via `gsettings` (velocidade, perfil de
    aceleração, limiar de arrasto) — estilo `gnome-control-center > Mouse`.
 2. **Curva de aceleração customizada velocidade-dependente** via daemon
-   `uinput` próprio, **com biblioteca de presets, suporte a múltiplos
-   mouses (cada um com sua curva), hot-plug e live monitor**.
+   `uinput` próprio, com **biblioteca de presets**, **hot-plug**, **live
+   monitor** e **detecção automática do mouse em uso** — você não precisa
+   escolher qual mouse configurar, o app detecta sozinho mexendo o mouse.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
