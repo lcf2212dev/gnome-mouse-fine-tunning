@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent
@@ -191,6 +192,127 @@ def device_id_from_evdev(dev) -> str:
     """Gera ID estável: 'vendor:product' em hex 4-digit lowercase."""
     info = dev.info
     return f"{info.vendor:04x}:{info.product:04x}"
+
+
+def _is_mouselike(dev) -> bool:
+    """Heurística: device é mouse (REL+botões, sem ABS). Exclui virtuais nossos."""
+    try:
+        import evdev as _evdev  # type: ignore
+    except ImportError:
+        return False
+    # filtrar nossos próprios virtuais
+    name = getattr(dev, "name", "") or ""
+    if name.startswith("MFT Virtual"):
+        return False
+    caps = dev.capabilities()
+    rels = caps.get(_evdev.ecodes.EV_REL, [])
+    if _evdev.ecodes.REL_X not in rels or _evdev.ecodes.REL_Y not in rels:
+        return False
+    if _evdev.ecodes.EV_ABS in caps:
+        return False
+    keys = caps.get(_evdev.ecodes.EV_KEY, [])
+    return _evdev.ecodes.BTN_LEFT in keys or _evdev.ecodes.BTN_MOUSE in keys
+
+
+def enumerate_present_mice() -> list[dict]:
+    """Retorna lista de mouses presentes [{id, name, path}, ...]."""
+    try:
+        import evdev as _evdev  # type: ignore
+    except ImportError:
+        return []
+    result = []
+    for path in _evdev.list_devices():
+        try:
+            dev = _evdev.InputDevice(path)
+        except OSError:
+            continue
+        try:
+            if _is_mouselike(dev):
+                result.append({
+                    "id": device_id_from_evdev(dev),
+                    "name": dev.name,
+                    "path": path,
+                })
+        finally:
+            dev.close()
+    return result
+
+
+def probe_mouse_activity(timeout: float = 1.5) -> dict[str, bool]:
+    """Probe rápido de atividade: abre cada mouse REL e detecta movimento.
+
+    Retorna dict {device_id: had_activity}. Devices que o daemon já tem em grab
+    NÃO vão acusar atividade aqui (apenas o grabber recebe eventos) — combine
+    com a lista de devices ativos no daemon via IPC para cobrir esse caso.
+    """
+    try:
+        import evdev as _evdev  # type: ignore
+        import select as _select
+    except ImportError:
+        return {}
+
+    activity: dict[str, bool] = {}
+    open_devs = []
+
+    for path in _evdev.list_devices():
+        try:
+            dev = _evdev.InputDevice(path)
+        except OSError:
+            continue
+        try:
+            if not _is_mouselike(dev):
+                dev.close()
+                continue
+            did = device_id_from_evdev(dev)
+            activity.setdefault(did, False)
+            # non-blocking
+            os.set_blocking(dev.fd, False)
+            open_devs.append((dev, did))
+        except Exception:
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                ready, _, _ = _select.select(
+                    [d.fd for d, _did in open_devs], [], [], min(remaining, 0.3)
+                )
+            except OSError:
+                break
+            if not ready:
+                continue
+            for fd in ready:
+                pair = next(((d, did) for d, did in open_devs if d.fd == fd), None)
+                if not pair:
+                    continue
+                dev, did = pair
+                try:
+                    for event in dev.read():
+                        if event.type == _evdev.ecodes.EV_REL and event.code in (
+                            _evdev.ecodes.REL_X,
+                            _evdev.ecodes.REL_Y,
+                        ):
+                            activity[did] = True
+                            break
+                except (BlockingIOError, OSError):
+                    continue
+            if all(activity.values()):
+                break  # tudo já ativo, sai cedo
+    finally:
+        for dev, _did in open_devs:
+            try:
+                dev.close()
+            except OSError:
+                pass
+
+    return activity
 
 
 def load_devices_config() -> dict:

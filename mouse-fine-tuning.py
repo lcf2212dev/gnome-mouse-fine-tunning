@@ -502,18 +502,45 @@ class BasicPage:
 
 
 class DevicesPage:
-    """Aba 'Dispositivos' — lista de mouses, switch on/off, dropdown preset."""
+    """Aba 'Dispositivos' — lista mouses em uso (com probe), switch on/off, dropdown preset."""
 
     def __init__(self, window: MouseFineTuningWindow) -> None:
         self.window = window
         self.page = Adw.PreferencesPage()
-        self._device_widgets: dict[str, dict] = {}  # id → {row, switch, combo}
+        self._device_widgets: dict[str, dict] = {}
         self._added_groups: list[Adw.PreferencesGroup] = []
-        self._status_group = None
         self._daemon_status_row = None
         self._daemon_switch = None
+        self._inactive_switch = None
         self._suppressing = False
+        # estado do probe
+        self.show_inactive = False
+        self.probed_activity: dict[str, bool] | None = None
+        self.probe_in_progress = False
         self.rebuild()
+        self.start_probe()
+
+    def start_probe(self) -> None:
+        if self.probe_in_progress:
+            return
+        self.probe_in_progress = True
+        self.probed_activity = None
+        self.rebuild()
+
+        def worker():
+            result = mft_common.probe_mouse_activity(timeout=1.5)
+            # devices que o daemon já intercepta contam como "em uso"
+            for did in self.window.daemon_active_devices:
+                result[did] = True
+            GLib.idle_add(self._on_probe_done, result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_probe_done(self, result: dict[str, bool]) -> bool:
+        self.probe_in_progress = False
+        self.probed_activity = result
+        self.rebuild()
+        return False
 
     def rebuild(self) -> None:
         # remover grupos previamente adicionados
@@ -525,7 +552,7 @@ class DevicesPage:
         self._added_groups.clear()
         self._device_widgets.clear()
 
-        # Status do daemon
+        # ---- status group ----
         status_group = Adw.PreferencesGroup(
             title="Curva customizada",
             description=(
@@ -541,33 +568,82 @@ class DevicesPage:
         status_group.add(self._daemon_switch)
 
         self._daemon_status_row = Adw.ActionRow(title="Status", subtitle="—")
-        refresh_btn = Gtk.Button(
-            icon_name="view-refresh-symbolic",
+        redetect_btn = Gtk.Button(
+            label="Re-detectar",
             valign=Gtk.Align.CENTER,
-            tooltip_text="Re-escanear mouses e atualizar status",
+            tooltip_text="Re-escanear mouses e probar atividade (~1.5 s — mexa o mouse durante)",
         )
-        refresh_btn.add_css_class("flat")
-        refresh_btn.connect("clicked", lambda *_: self.window.refresh_all())
-        self._daemon_status_row.add_suffix(refresh_btn)
+        redetect_btn.add_css_class("flat")
+        redetect_btn.connect("clicked", lambda *_: self.start_probe())
+        self._daemon_status_row.add_suffix(redetect_btn)
         status_group.add(self._daemon_status_row)
+
+        self._inactive_switch = Adw.SwitchRow(
+            title="Mostrar mouses sem atividade",
+            subtitle="Lista também dispositivos detectados mas não em uso agora.",
+        )
+        self._inactive_switch.set_active(self.show_inactive)
+        self._inactive_switch.connect("notify::active", self._on_inactive_toggle)
+        status_group.add(self._inactive_switch)
         self._add_group(status_group)
 
-        # Mouses
-        devices = self.window.list_devices_with_config()
-        if not devices:
+        # ---- placeholder durante probe ----
+        if self.probe_in_progress and self.probed_activity is None:
+            probing = Adw.PreferencesGroup(
+                title="Detectando mouses em uso…",
+                description="Mexa o mouse que você quer configurar (até 1.5 s).",
+            )
+            self._add_group(probing)
+            self.refresh_status()
+            return
+
+        # ---- lista de devices ----
+        all_devices = self.window.list_devices_with_config()
+        for entry in all_devices:
+            in_daemon = entry["id"] in self.window.daemon_active_devices
+            probed = (self.probed_activity or {}).get(entry["id"], False)
+            entry["in_use"] = in_daemon or probed
+
+        if self.show_inactive:
+            visible = all_devices
+        else:
+            visible = [
+                d for d in all_devices
+                if d["in_use"] or d.get("config", {}).get("enabled")
+            ]
+        hidden_count = len(all_devices) - len(visible)
+
+        if not visible:
             empty = Adw.PreferencesGroup(
-                title="Nenhum mouse detectado",
+                title="Nenhum mouse em uso detectado",
                 description=(
-                    "Conecte um mouse com EV_REL (não touchpad). "
-                    "Clique no ícone de refresh para re-escanear."
+                    f"Detectei {len(all_devices)} mouse(s) presente(s), mas nenhum gerou "
+                    "movimento. Mexa o mouse e clique em Re-detectar, ou ative "
+                    "“Mostrar mouses sem atividade”."
                 ),
             )
             self._add_group(empty)
         else:
-            for entry in devices:
+            for entry in visible:
                 self._add_group(self._build_device_group(entry))
 
+        if hidden_count > 0 and not self.show_inactive:
+            hint = Adw.PreferencesGroup(
+                title="",
+                description=(
+                    f"{hidden_count} mouse(s) sem atividade ocultos. "
+                    "Ative “Mostrar mouses sem atividade” acima pra ver."
+                ),
+            )
+            self._add_group(hint)
+
         self.refresh_status()
+
+    def _on_inactive_toggle(self, switch, _pspec) -> None:
+        if self._suppressing:
+            return
+        self.show_inactive = switch.get_active()
+        self.rebuild()
 
     def _add_group(self, g: Adw.PreferencesGroup) -> None:
         self.page.add(g)
@@ -577,12 +653,18 @@ class DevicesPage:
         present = entry.get("present", False)
         config_entry = entry.get("config", {})
         display_name = entry.get("name") or config_entry.get("name", "(sem nome)")
+        in_use = entry.get("in_use", False)
+        enabled = bool(config_entry.get("enabled", False))
 
         sub = f"ID {entry['id']}"
         if not present:
             sub += " · desconectado"
-        elif entry.get("active"):
-            sub += " · ativo (curva sendo aplicada)"
+        elif in_use and enabled:
+            sub += " · em uso · curva aplicada"
+        elif in_use:
+            sub += " · em uso · curva desligada"
+        elif enabled:
+            sub += " · habilitado, sem movimento detectado"
         else:
             sub += " · presente, parado"
 
@@ -1086,6 +1168,8 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
         self.settings = Gio.Settings.new(SCHEMA)
         self.presets: list[dict] = []
         self.active_preset_name: str | None = None
+        # devices que o daemon está interceptando agora (atualizado via IPC)
+        self.daemon_active_devices: set[str] = set()
 
         # IPC
         self.ipc = DaemonIPC()
@@ -1116,18 +1200,20 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
             self.presets_page.rebuild_preset_list(select_name=self.active_preset_name)
 
     def list_devices_with_config(self) -> list[dict]:
-        """Lista combinada: presentes (evdev) + config (devices.json)."""
+        """Lista combinada: presentes (evdev) + config (devices.json). Exclui virtuais."""
         cfg = mft_common.load_devices_config()
-        present = self._enumerate_present_mice()
+        present_raw = mft_common.enumerate_present_mice()
+        present = [
+            {"id": d["id"], "name": d["name"], "path": d["path"], "present": True}
+            for d in present_raw
+        ]
         present_ids = {d["id"] for d in present}
 
-        # Add devices from config to presence info
         for entry in present:
             cfg_entry = mft_common.find_device(cfg, entry["id"])
             entry["config"] = cfg_entry or {}
             entry["active"] = bool(cfg_entry and cfg_entry.get("enabled"))
 
-        # configurados mas ausentes
         result = list(present)
         for d in cfg.get("devices", []):
             if d["id"] not in present_ids:
@@ -1138,38 +1224,6 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
                     "active": False,
                     "config": d,
                 })
-        return result
-
-    @staticmethod
-    def _enumerate_present_mice() -> list[dict]:
-        try:
-            import evdev  # type: ignore
-        except ImportError:
-            return []
-        result = []
-        for path in evdev.list_devices():
-            try:
-                dev = evdev.InputDevice(path)
-            except OSError:
-                continue
-            try:
-                caps = dev.capabilities()
-                rels = caps.get(evdev.ecodes.EV_REL, [])
-                if (
-                    evdev.ecodes.REL_X in rels
-                    and evdev.ecodes.REL_Y in rels
-                    and evdev.ecodes.EV_ABS not in caps
-                ):
-                    keys = caps.get(evdev.ecodes.EV_KEY, [])
-                    if evdev.ecodes.BTN_LEFT in keys or evdev.ecodes.BTN_MOUSE in keys:
-                        result.append({
-                            "id": mft_common.device_id_from_evdev(dev),
-                            "name": dev.name,
-                            "path": path,
-                            "present": True,
-                        })
-            finally:
-                dev.close()
         return result
 
     # ----- UI -----
@@ -1221,7 +1275,13 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
 
     def _on_ipc_device_list(self, msg: dict) -> bool:
         devices = msg.get("devices", [])
+        new_active = {d["id"] for d in devices if d.get("active")}
+        old_active = self.daemon_active_devices
+        self.daemon_active_devices = new_active
         self.presets_page.update_devices(devices)
+        if new_active != old_active and hasattr(self, "devices_page"):
+            # estado do daemon mudou — re-renderizar lista
+            self.devices_page.rebuild()
         return False
 
     def _on_ipc_connect_changed(self, connected: bool) -> bool:
