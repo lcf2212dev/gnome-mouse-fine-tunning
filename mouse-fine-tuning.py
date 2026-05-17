@@ -618,6 +618,27 @@ class PresetsPage:
         preview_group.add(host)
         self.page.add(preview_group)
 
+        # ----- grupo: aplicar curva (visível só pra presets não-Adaptativa) -----
+        self.apply_group = Adw.PreferencesGroup(
+            title="Ativar curva",
+            description=(
+                "Esta curva customizada substitui a aceleração nativa do GNOME. "
+                "Clique para aplicar — o sistema detecta seu mouse automaticamente. "
+                "Pra voltar ao normal, selecione “Adaptativa” no combo acima."
+            ),
+        )
+        self.apply_action_row = Adw.ActionRow(
+            title="Status", subtitle="Curva não aplicada"
+        )
+        self.apply_btn = Gtk.Button(
+            label="Aplicar curva",
+            valign=Gtk.Align.CENTER,
+        )
+        self.apply_btn.add_css_class("suggested-action")
+        self.apply_btn.connect("clicked", self._on_apply_clicked)
+        self.apply_action_row.add_suffix(self.apply_btn)
+        self.apply_group.add(self.apply_action_row)
+        self.page.add(self.apply_group)
 
         # ----- grupo: live monitor -----
         live_group = Adw.PreferencesGroup(
@@ -698,8 +719,17 @@ class PresetsPage:
 
         self.preview.set_curve(preset["curve"])
 
+        # Mostrar/ocultar grupo "Aplicar curva" baseado no preset
+        if hasattr(self, "apply_group"):
+            self.apply_group.set_visible(not is_builtin or not mft_common.is_system_default(preset))
+            # Atualizar texto do status
+            self._refresh_apply_label()
+
         if previous != preset["name"]:
-            self.schedule_auto_apply()
+            # Adaptativa: re-aplica (libera grabs). Curva customizada: NÃO
+            # aplica automaticamente — usuário clica "Aplicar" manualmente.
+            if mft_common.is_system_default(preset):
+                self.schedule_auto_apply()
 
     # ----- editing -----
 
@@ -817,10 +847,12 @@ class PresetsPage:
         """Recebe lista do daemon via IPC."""
         self._live_devices = [d for d in devices if d.get("present")]
         self._in_use_ids = set(self.window.daemon_active_devices)
+        self._refresh_apply_label()
 
     def refresh_apply_status(self) -> None:
-        """Compat: chamado de refresh_all e periodic_tick — só sincroniza estado."""
+        """Compat: chamado de refresh_all e periodic_tick."""
         self._in_use_ids = set(self.window.daemon_active_devices)
+        self._refresh_apply_label()
 
     def schedule_auto_apply(self) -> None:
         """Agenda uma aplicação automática (debounce 300ms)."""
@@ -829,7 +861,10 @@ class PresetsPage:
         self._auto_apply_timer = GLib.timeout_add(300, self._do_auto_apply)
 
     def _do_auto_apply(self) -> bool:
-        """Detecta mouse em uso (probe assíncrono) e aplica preset selecionado."""
+        """Auto-apply silencioso: SÓ para o preset Adaptativa (libera grabs).
+        Curvas customizadas NÃO são aplicadas automaticamente — exigem clique
+        explícito no botão 'Aplicar curva' (evita travar o mouse acidentalmente
+        com curvas mal ajustadas)."""
         self._auto_apply_timer = None
         preset = self._current_preset()
         if not preset:
@@ -837,34 +872,59 @@ class PresetsPage:
         if not daemon_unit_exists():
             return GLib.SOURCE_REMOVE
 
-        # Caso especial: Adaptativa (sistema padrão) — aplica imediatamente,
-        # sem probe. apply_preset_to_in_use vai disable_curve_everywhere +
-        # accel-profile=adaptive, fazendo o GNOME assumir o controle.
         if mft_common.is_system_default(preset):
             self.window.apply_preset_to_in_use(preset["name"], set())
             if self.window.ipc.connected:
                 self.window.ipc.request_device_list()
-            return GLib.SOURCE_REMOVE
-
-        # Curva customizada: precisa do daemon rodando + probe pra saber em
-        # qual(is) mouse(s) aplicar.
-        if not daemon_active():
-            daemon_start()
-
-        def worker():
-            in_use = self.window.detect_in_use_now(timeout=3.0)
-            if not in_use:
-                return
-            GLib.idle_add(self._finish_auto_apply, preset["name"], in_use)
-
-        threading.Thread(target=worker, daemon=True).start()
         return GLib.SOURCE_REMOVE
 
-    def _finish_auto_apply(self, preset_name: str, in_use: set[str]) -> bool:
-        self.window.apply_preset_to_in_use(preset_name, in_use)
+    def _on_apply_clicked(self, _btn) -> None:
+        """Botão 'Aplicar curva' — só aparece pra presets não-Adaptativa."""
+        preset = self._current_preset()
+        if not preset:
+            return
+        if mft_common.is_system_default(preset):
+            return
+        if not daemon_unit_exists():
+            self.window.toast("Daemon não instalado — rode ./setup.sh install")
+            return
+        if not daemon_active():
+            daemon_start()
+        self.apply_btn.set_sensitive(False)
+        self.apply_action_row.set_subtitle("Detectando mouse em uso (mexa o mouse)…")
+
+        def worker():
+            in_use = self.window.detect_in_use_now(timeout=2.0)
+            if not in_use:
+                # Fallback: aplicar a todos os mouses presentes
+                in_use = {m["id"] for m in mft_common.enumerate_present_mice()}
+            GLib.idle_add(self._finish_apply, preset["name"], in_use)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_apply(self, preset_name: str, in_use: set[str]) -> bool:
+        n = self.window.apply_preset_to_in_use(preset_name, in_use)
+        self.apply_btn.set_sensitive(True)
+        if n > 0:
+            self.window.toast(f"Curva “{preset_name}” aplicada a {n} mouse(s)")
+        else:
+            self.window.toast("Nenhum mouse detectado")
+        self._refresh_apply_label()
         if self.window.ipc.connected:
             self.window.ipc.request_device_list()
         return False
+
+    def _refresh_apply_label(self) -> None:
+        """Atualiza o subtítulo do row 'Status' baseado no estado do daemon."""
+        if not hasattr(self, "apply_action_row"):
+            return
+        active = self.window.daemon_active_devices
+        if active:
+            self.apply_action_row.set_subtitle(
+                f"Aplicada · interceptando {len(active)} mouse(s)"
+            )
+        else:
+            self.apply_action_row.set_subtitle("Curva não aplicada")
 
     # ----- live monitor -----
 
@@ -941,23 +1001,10 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
         self.refresh_all()
         GLib.timeout_add_seconds(3, self._periodic_tick)
 
-        # Auto-apply silencioso ao boot + a cada 8s
+        # Auto-apply silencioso no boot — só pra Adaptativa (sem grab).
+        # Pra curvas customizadas, o usuário precisa clicar "Aplicar curva"
+        # explicitamente (evita travamento acidental do mouse).
         self.presets_page.schedule_auto_apply()
-        GLib.timeout_add_seconds(8, self._periodic_redetect)
-
-    def _periodic_redetect(self) -> bool:
-        """A cada 8s, probe leve pra detectar mouses novos."""
-        def worker():
-            probed = mft_common.probe_mouse_activity(timeout=0.4)
-            new_movers = {did for did, in_use in probed.items() if in_use}
-            current = set(self.daemon_active_devices)
-            new_in_use = current | new_movers
-            if new_in_use and new_in_use != current:
-                preset = self.active_preset_name
-                if preset:
-                    GLib.idle_add(self.apply_preset_to_in_use, preset, new_in_use)
-        threading.Thread(target=worker, daemon=True).start()
-        return GLib.SOURCE_CONTINUE
 
     # ----- presets/devices state -----
 
