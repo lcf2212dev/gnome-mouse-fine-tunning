@@ -1,0 +1,13 @@
+{
+  "name": "Linear",
+  "description": "Sem aceleração — movimento 1:1, multiplicador constante.",
+  "builtin": true,
+  "order": 0,
+  "curve": {
+    "sensitivity": 1.0,
+    "gain": 0.0,
+    "power": 1.0,
+    "deadzone": 0.0,
+    "max_multiplier": 1.0
+  }
+}

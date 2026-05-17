@@ -1,0 +1,13 @@
+{
+  "name": "FPS",
+  "description": "Para jogos de tiro: precisão em micro-ajustes + aceleração agressiva em flicks rápidos.",
+  "builtin": true,
+  "order": 2,
+  "curve": {
+    "sensitivity": 0.8,
+    "gain": 1.0,
+    "power": 1.8,
+    "deadzone": 50.0,
+    "max_multiplier": 4.0
+  }
+}

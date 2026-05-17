@@ -1,0 +1,13 @@
+{
+  "name": "Suave",
+  "description": "Para produtividade e uso geral: aceleração leve, dead-zone pequena.",
+  "builtin": true,
+  "order": 1,
+  "curve": {
+    "sensitivity": 0.9,
+    "gain": 0.3,
+    "power": 1.3,
+    "deadzone": 20.0,
+    "max_multiplier": 2.0
+  }
+}

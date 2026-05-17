@@ -1,0 +1,13 @@
+{
+  "name": "Quake",
+  "description": "Curva clássica do Quake/CS 1.6: aceleração quadrática sem dead-zone, alto teto.",
+  "builtin": true,
+  "order": 3,
+  "curve": {
+    "sensitivity": 1.0,
+    "gain": 0.5,
+    "power": 2.0,
+    "deadzone": 0.0,
+    "max_multiplier": 6.0
+  }
+}
