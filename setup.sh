@@ -135,7 +135,7 @@ install_desktop_entry() {
 install_deps() {
     step "Verificando dependências"
     local missing=()
-    for pkg in python python-gobject gtk4 libadwaita python-evdev; do
+    for pkg in python python-gobject gtk4 libadwaita python-evdev python-pyudev; do
         if ! need_pkg "$pkg"; then
             missing+=("$pkg")
         else

@@ -5,98 +5,140 @@ Aplicativo GTK4 + libadwaita para Manjaro/GNOME que combina:
 1. **Configurações nativas do mouse** via `gsettings` (velocidade, perfil de
    aceleração, limiar de arrasto) — estilo `gnome-control-center > Mouse`.
 2. **Curva de aceleração customizada velocidade-dependente** via daemon
-   `uinput` próprio, controlado pela GUI e iniciado pelo `systemd --user`.
+   `uinput` próprio, **com biblioteca de presets, suporte a múltiplos
+   mouses (cada um com sua curva), hot-plug e live monitor**.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  Mouse Fine-Tuning   [Configurações | Curva]      ☰     │
-├──────────────────────────────────────────────────────────┤
-│  Velocidade ─────────────────────────────────────────────│
-│  • Velocidade do ponteiro     [────●────] -1.0 ... 1.0   │
-│  • Ajuste fino                          [-0.05  ⏶⏷]      │
-│                                                          │
-│  Aceleração nativa ──────────────────────────────────────│
-│  • Perfil de aceleração        [ Adaptativa     v ]      │
-│                                                          │
-│  Fine-tuning ────────────────────────────────────────────│
-│  • Limiar de arrasto                          [ 8  ⏶⏷]   │
+│  Mouse Fine-Tuning   [Configurações|Dispositivos|Presets]│
 └──────────────────────────────────────────────────────────┘
 
-┌──────────────────────────────────────────────────────────┐
-│  Mouse Fine-Tuning   [Configurações | Curva]      ☰     │
-├──────────────────────────────────────────────────────────┤
-│  Curva customizada ──────────────────────────────────────│
-│  • Habilitar curva customizada              [ on/off ]   │
-│  • Mouse                       [ Logitech G502  v ]      │
-│  • Status do daemon: Ativo                       [↻]     │
+╭─ Aba Dispositivos ───────────────────────────────────────╮
+│ Curva customizada                                        │
+│ • Daemon ativo                          [ on ]           │
+│ • Status: Ativo · 1 mouse(s) habilitado(s)        [↻]    │
 │                                                          │
-│  Parâmetros da curva ────────────────────────────────────│
-│  • Sensibilidade base                    [ 1.00  ⏶⏷]    │
-│  • Ganho de aceleração                   [ 0.10  ⏶⏷]    │
-│  • Expoente                              [ 1.50  ⏶⏷]    │
-│  • Dead-zone (px/s)                      [    0  ⏶⏷]    │
-│  • Multiplicador máximo                  [  3.0  ⏶⏷]    │
+│ Logitech USB Receiver Mouse                              │
+│ ID 046d:c548 · ativo (curva sendo aplicada)              │
+│ • Aceleração customizada                [ on ]           │
+│ • Preset                       [ FPS           v ]       │
 │                                                          │
-│  Visualização da curva ──────────────────────────────────│
-│  ┌─────────────────────────────────────────────┐         │
-│  │ ×3.0│                              _______   │         │
-│  │     │                         ____/          │         │
-│  │     │                  ______/               │         │
-│  │ ×1.0│- - - - - - _____/ - - - - - - - - - - │         │
-│  │     │__________/                             │         │
-│  │     └──────────────────────────────────────►│         │
-│  │       0 px/s                       3000 px/s│         │
-│  └─────────────────────────────────────────────┘         │
-└──────────────────────────────────────────────────────────┘
+│ Logitech Wireless Receiver Mouse                         │
+│ ID 046d:c542 · presente, parado                          │
+│ • Aceleração customizada                [ off ]          │
+│ • Preset                       [ Desenho       v ]       │
+╰──────────────────────────────────────────────────────────╯
+
+╭─ Aba Presets ────────────────────────────────────────────╮
+│ Biblioteca de presets                                    │
+│ • Preset                       [ FPS           v ]       │
+│ • Descrição (Built-in): Para jogos de tiro: ...          │
+│ • Ações       [Duplicar] [Renomear] [Deletar]            │
+│                                                          │
+│ Parâmetros (read-only se built-in)                       │
+│ • Sensibilidade base                       [ 0.80 ⏶⏷]    │
+│ • Ganho de aceleração                      [ 1.00 ⏶⏷]    │
+│ • Expoente                                 [ 1.80 ⏶⏷]    │
+│ • Dead-zone (px/s)                         [    50 ⏶⏷]   │
+│ • Multiplicador máximo                     [ 4.0  ⏶⏷]    │
+│                                                          │
+│ Preview da curva                                         │
+│ ┌──────────────────────────────────────────────────┐     │
+│ │ ×4.0|                            _____           │     │
+│ │     |                         __/                │     │
+│ │     |                    ____/                   │     │
+│ │ ×1.0|- - - - - -_______/                         │     │
+│ │     |__________/                                 │     │
+│ │     +─────────────────────────────────────────►  │     │
+│ │     0 px/s                            3000 px/s  │     │
+│ └──────────────────────────────────────────────────┘     │
+│                                                          │
+│ Live monitor (osciloscópio)                              │
+│ • Mostrar movimento real             [ on ]              │
+│ • Monitorar mouse              [ Logitech USB  v ]       │
+│ ┌──────────────────────────────────────────────────┐     │
+│ │ 2400 px/s|         _                             │     │
+│ │          |      __/ \    ___    — Entrada        │     │
+│ │          |    _/     \__/   \   — Saída          │     │
+│ │          | __/                \_                 │     │
+│ │          |/                                      │     │
+│ │          +───────────────────────────────────►   │     │
+│ │           -5s                              agora │     │
+│ └──────────────────────────────────────────────────┘     │
+╰──────────────────────────────────────────────────────────╯
 ```
 
-## Como funciona a curva customizada
+## Como funciona
 
-A fórmula aplicada por sample do mouse (a cada `SYN_REPORT`):
+### A fórmula da curva
+
+Para cada par `(dx, dy)` que sai do mouse, em cada `SYN_REPORT`:
 
 ```
-speed_pps   = √(dx² + dy²) / dt            # pixels por segundo
-effective   = max(0, speed_pps − dead_zone)
-accel       = gain × (effective / 1000)^power
-multiplier  = min(sensitivity × (1 + accel), max_multiplier)
+speed_pps  = √(dx² + dy²) / dt
+effective  = max(0, speed_pps − dead_zone)
+accel      = gain × (effective / 1000)^power
+multiplier = min(sensitivity × (1 + accel), max_multiplier)
 
 out_dx = dx × multiplier
 out_dy = dy × multiplier
 ```
 
-Pontos-chave:
+| Parâmetro | O que faz |
+|---|---|
+| `sensitivity` | Multiplicador base — afeta tudo, mesmo em velocidade 0. |
+| `gain` | Quão forte a aceleração cresce com a velocidade. |
+| `power` | Curvatura. 1.0 = linear; >1 cresce mais rápido em alta speed. |
+| `deadzone` | Movimentos abaixo desse limiar (px/s) não recebem aceleração. |
+| `max_multiplier` | Teto absoluto do multiplicador. |
 
-- **sensibilidade**: multiplicador "base", aplicado mesmo em velocidade zero.
-- **ganho**: define o quão forte é o efeito de "mais velocidade → mais aceleração".
-- **expoente**: curvatura. `1.0` = linear; `2.0` = quadrática (cresce rápido); `0.5` = raiz (cresce devagar).
-- **dead-zone**: movimentos lentos abaixo deste limiar não recebem aceleração extra (bom para mira precisa).
-- **multiplicador máximo**: teto absoluto — impede "voo" descontrolado.
+### Os 5 presets built-in
 
-A curva é aplicada por um daemon Python (`mouse-curve-daemon.py`) que:
+| Nome | Sensibilidade | Ganho | Expoente | Dead-zone | Max | Uso |
+|---|---|---|---|---|---|---|
+| **Linear** | 1.0 | 0.0 | 1.0 | 0 | 1.0 | Sem aceleração, movimento 1:1 |
+| **Suave** | 0.9 | 0.3 | 1.3 | 20 | 2.0 | Produtividade — leve, intuitiva |
+| **FPS** | 0.8 | 1.0 | 1.8 | 50 | 4.0 | Jogos de tiro |
+| **Quake** | 1.0 | 0.5 | 2.0 | 0 | 6.0 | Quake/CS 1.6 clássica |
+| **Desenho** | 0.7 | 0.5 | 2.5 | 100 | 3.0 | Edição/desenho — alta precisão |
 
-1. Captura eventos do mouse físico via `evdev` (`/dev/input/event*`).
-2. Faz `grab` exclusivo (eventos do mouse físico não chegam mais no compositor).
-3. Aplica a curva em cada par `(dx, dy)`.
-4. Re-emite via `uinput` em um mouse virtual visível ao Wayland/Mutter.
-5. Recarrega config em vivo ao receber `SIGHUP` (a GUI faz isso ao salvar).
+Built-ins são **read-only**. Pra ajustar, **Duplique** e edite a cópia.
 
-Quando o daemon está ativo, o GNOME aplica `accel-profile = flat` em cima — a
-única curva em ação é a sua. A GUI seta isso automaticamente ao habilitar.
+### Multi-device + hot-plug
+
+Cada mouse físico (identificado por `vendor:product`) tem o seu próprio preset
+assinado em `~/.config/mouse-fine-tuning/devices.json`. O daemon roda **todos
+os mouses habilitados simultaneamente** — você pode ter um Logitech G502 no
+preset FPS e um trackball no preset Suave ao mesmo tempo.
+
+Hot-plug funciona via `python-pyudev`: quando você pluga um mouse novo, o
+daemon detecta em segundos e a GUI lista ele. Quando você despluga, o daemon
+fecha o handle limpo.
+
+### Live monitor
+
+A aba "Presets" tem um **osciloscópio**: ele mostra em tempo real a velocidade
+do seu mouse passando pela curva. Linha **cinza** = velocidade de entrada (o
+que sai do hardware); linha **azul** = velocidade de saída (depois da curva).
+
+Implementado via socket Unix em `$XDG_RUNTIME_DIR/mouse-curve-daemon.sock` —
+o daemon faz broadcast throttled a 30 Hz, a GUI conecta on-demand quando o
+switch "Mostrar movimento real" é ligado.
 
 ## Requisitos
 
-Pacman (Manjaro/Arch):
+Pacotes pacman (Manjaro/Arch):
 
 ```bash
-sudo pacman -S python python-gobject gtk4 libadwaita python-evdev
+sudo pacman -S python python-gobject gtk4 libadwaita python-evdev python-pyudev
 ```
+
+`python-pyudev` é opcional — sem ele, daemon roda mas sem hot-plug.
 
 Versões testadas: Python 3.14, PyGObject 3.56, GTK 4.22, libadwaita 1.9,
 python-evdev 1.9, GNOME 50.
 
-## Instalação completa (recomendado)
-
-Use o `setup.sh`:
+## Instalação completa
 
 ```bash
 git clone git@github.com:lcf2212dev/gnome-mouse-fine-tunning.git
@@ -106,54 +148,30 @@ cd gnome-mouse-fine-tunning
 
 O instalador:
 
-1. Verifica/instala os pacotes pacman acima.
-2. Cria `/etc/udev/rules.d/99-uinput.rules` (libera `/dev/uinput` ao grupo `input`)
-   e recarrega o udev.
-3. Verifica se você está no grupo `input` (avisa se faltar).
-4. Copia `mouse-curve-daemon.service` para `~/.config/systemd/user/` e roda
-   `daemon-reload`.
-5. Copia `br.dev.lcf2212.MouseFineTuning.desktop` para `~/.local/share/applications/`.
-6. Ajusta os caminhos absolutos para o diretório onde você clonou o repo.
+1. Verifica/instala pacotes pacman (incluindo `python-pyudev`).
+2. Carrega o módulo `uinput` no kernel e configura autoload via
+   `/etc/modules-load.d/uinput.conf`.
+3. Cria `/etc/udev/rules.d/99-uinput.rules` (libera `/dev/uinput` ao
+   grupo `input`) e recarrega o udev.
+4. Verifica que você está no grupo `input` (adiciona se faltar).
+5. Copia `mouse-curve-daemon.service` para `~/.config/systemd/user/`.
+6. Instala o `.desktop` em `~/.local/share/applications/`.
 
-Após isso, pressione `Super`, digite "Mouse" e o app aparece.
+Depois disso, `Super → "Mouse"` abre o app.
 
-## Uso
+## Persistência
 
-### Aba "Configurações"
-
-Mesma coisa que o `gnome-control-center` faz para mouse, em uma só tela:
-
-| Controle | Chave de gsettings |
+| Arquivo | Conteúdo |
 |---|---|
-| Velocidade do ponteiro / Ajuste fino | `speed` (`double`, -1.0..1.0) |
-| Perfil de aceleração | `accel-profile` (`default` / `flat` / `adaptive`) |
-| Limiar de arrasto | `drag-threshold` (`int`, 1..30) |
+| `~/.config/dconf/user` (via gsettings) | velocidade, perfil de aceleração, limiar de arrasto |
+| `~/.config/mouse-fine-tuning/devices.json` | per-device: id, preset escolhido, enabled |
+| `~/.config/mouse-fine-tuning/presets/_builtin/*.json` | cópia em runtime dos built-ins (sincronizada com o repo) |
+| `~/.config/mouse-fine-tuning/presets/custom/*.json` | presets criados/editados por você |
+| `~/.config/systemd/user/mouse-curve-daemon.service` | unit do daemon |
+| `/etc/udev/rules.d/99-uinput.rules` | permissão de `/dev/uinput` |
+| `/etc/modules-load.d/uinput.conf` | autoload do módulo no boot |
 
-Tudo persiste em `dconf` e tem efeito imediato.
-
-### Aba "Curva"
-
-1. **Selecione seu mouse** no combo "Mouse". Se houver mais de um, escolha o
-   que você quer interceptar (o outro continua usando a aceleração do GNOME).
-2. **Ajuste os 5 sliders** — o preview ao lado atualiza em tempo real.
-3. **Habilite** com o switch "Habilitar curva customizada". O daemon é
-   iniciado pelo systemd e o perfil de aceleração nativo é forçado para
-   `flat` automaticamente.
-
-Para reverter, basta desligar o switch (o daemon para, o perfil nativo
-volta a ser o que você escolheu manualmente, e o mouse volta ao
-comportamento normal do GNOME).
-
-#### Sugestões de partida
-
-| Perfil | sensibilidade | ganho | expoente | dead-zone | max |
-|---|---|---|---|---|---|
-| Linear (sem curva) | 1.0 | 0.0 | 1.0 | 0 | 1.0 |
-| Suave (mira + produtividade) | 0.9 | 0.3 | 1.4 | 30 | 2.5 |
-| Agressivo (FPS) | 0.8 | 1.0 | 1.8 | 50 | 4.0 |
-| Quake-style | 1.0 | 0.5 | 2.0 | 0 | 6.0 |
-
-## Verificar status / debug
+## Debug
 
 ```bash
 # Status geral
@@ -167,27 +185,28 @@ systemctl --user restart mouse-curve-daemon.service
 
 # Recarregar só config (sem reiniciar)
 systemctl --user kill --signal=HUP mouse-curve-daemon.service
+
+# Verificar socket IPC do live monitor
+ls -la "${XDG_RUNTIME_DIR}/mouse-curve-daemon.sock"
 ```
 
-## Persistência
+## Migração da v0.2
 
-| Arquivo | O que guarda |
-|---|---|
-| `~/.config/dconf/user` (via gsettings) | velocidade, perfil de aceleração, limiar de arrasto |
-| `~/.config/mouse-fine-tuning/curve.json` | parâmetros da curva e dispositivo selecionado |
-| `~/.config/systemd/user/mouse-curve-daemon.service` | unit do daemon |
-| `/etc/udev/rules.d/99-uinput.rules` | permissão de `/dev/uinput` |
+Se você usou a v0.2 (curva única, sem presets), na primeira execução da v0.3
+o app migra automaticamente:
+
+- `~/.config/mouse-fine-tuning/curve.json` → renomeado para `curve.json.v0.2.bak`
+- Os parâmetros viram um preset custom chamado **"Migrado da v0.2"**
+- `devices.json` novo é criado, e seus mouses aparecem na aba "Dispositivos"
+  com o preset migrado disponível pra escolher
 
 ## Limitações conhecidas
 
-- **Só GNOME.** Schema usado é do GNOME. KDE/Cinnamon não vão reagir.
-- **Curva é global por mouse selecionado.** Se você tem 2 mouses e quer curvas
-  diferentes, hoje precisa alternar o "Mouse" selecionado e reiniciar o daemon.
-- **Touchpad é fora do escopo.** O daemon ignora dispositivos com `EV_ABS`
-  (touchpads, tablets) — só intercepta mouses com `EV_REL`.
-- **Hot-plug.** Se você desconectar o mouse selecionado, o daemon termina
-  com erro. Habilite-o de novo no app depois de reconectar.
-- **Latência adicional.** O interceptor adiciona ~50–200 µs por sample. Imperceptível em uso normal; perceptível só em medições.
+- **Só GNOME.** Schema usado é do GNOME. KDE/Cinnamon/XFCE têm schemas próprios.
+- **Latência adicional.** O interceptor adiciona ~50–200 µs por sample. Imperceptível em uso normal.
+- **Per-mouse via vendor:product.** Se você tem 2 mouses idênticos, eles compartilham o mesmo perfil. (Próxima versão: incluir `phys` no ID.)
+- **Touchpad fora do escopo.** O daemon ignora dispositivos com `EV_ABS`.
+- **Sem suporte a wheel/scroll customizado.** Pass-through direto.
 
 ## Desinstalar
 
@@ -196,11 +215,7 @@ systemctl --user kill --signal=HUP mouse-curve-daemon.service
 ```
 
 Remove a unit do systemd, o `.desktop` e (opcionalmente) a udev rule. Os
-arquivos de configuração em `~/.config/mouse-fine-tuning/` ficam, caso você
-queira manter os parâmetros para uma reinstalação futura.
-
-Para resetar também as configurações nativas do GNOME, use o menu
-**"Restaurar padrões"** dentro do app antes de desinstalar.
+arquivos de configuração em `~/.config/mouse-fine-tuning/` ficam.
 
 ## Licença
 
