@@ -28,67 +28,85 @@ need_pkg() {
     return 0
 }
 
-load_uinput_module() {
-    step "Carregando módulo de kernel 'uinput'"
-    if lsmod | grep -qE '^uinput\b'; then
-        ok "Módulo uinput já está carregado."
-    else
-        sudo modprobe uinput
-        if lsmod | grep -qE '^uinput\b'; then
-            ok "Módulo uinput carregado."
-        else
-            fail "Não foi possível carregar o módulo uinput. Verifique o kernel."
-            exit 1
-        fi
-    fi
+test_uinput_works() {
+    # Retorna 0 se o usuário atual consegue abrir /dev/uinput, 1 caso contrário.
+    python3 - <<'PYEOF' 2>/dev/null
+import evdev
+u = evdev.UInput()
+u.close()
+PYEOF
+}
 
-    # Persistir entre reboots
+ensure_module_autoload() {
     local modules_conf="/etc/modules-load.d/uinput.conf"
-    if [[ ! -f "${modules_conf}" ]] || ! grep -q '^uinput$' "${modules_conf}" 2>/dev/null; then
-        echo "uinput" | sudo tee "${modules_conf}" >/dev/null
+    if [[ -f "${modules_conf}" ]] && grep -qx 'uinput' "${modules_conf}" 2>/dev/null; then
+        ok "uinput já configurado para carregar no boot."
+        return 0
+    fi
+    if echo "uinput" | sudo tee "${modules_conf}" >/dev/null 2>&1; then
         ok "Configurado para carregar uinput no boot (${modules_conf})."
     else
-        ok "uinput já configurado para carregar no boot."
+        warn "Não consegui escrever ${modules_conf} (sem sudo?). Rode manualmente:"
+        printf "        echo 'uinput' | sudo tee %s\n" "${modules_conf}"
+        warn "Sem esse arquivo, você precisará carregar uinput após cada reboot:"
+        printf "        sudo modprobe uinput\n"
     fi
 }
 
-install_udev_rule() {
-    step "Instalando udev rule (libera /dev/uinput pro grupo 'input')"
-    if [[ -r "${UDEV_RULE_DST}" ]] && cmp -s "${UDEV_RULE_SRC}" "${UDEV_RULE_DST}"; then
-        ok "${UDEV_RULE_DST} já está atualizado."
-    else
+ensure_uinput_works() {
+    step "Verificando acesso a /dev/uinput"
+
+    # Caminho feliz: já funciona.
+    if test_uinput_works; then
+        ok "/dev/uinput acessível pelo seu usuário."
+        ensure_module_autoload
+        return 0
+    fi
+
+    warn "/dev/uinput não está utilizável. Configurando..."
+
+    # 1) Garantir que o módulo está carregado
+    sudo modprobe uinput 2>&1 || true
+    ensure_module_autoload
+
+    # 2) Garantir que o usuário está no grupo 'input'
+    if ! id -nG "$USER" | tr ' ' '\n' | grep -qx input; then
+        warn "Usuário '$USER' NÃO está no grupo 'input'. Adicionando..."
+        sudo usermod -aG input "$USER"
+        warn "Você PRECISA fazer logout/login para o grupo entrar em vigor."
+    fi
+
+    # 3) Instalar udev rule
+    if [[ ! -r "${UDEV_RULE_DST}" ]] || ! cmp -s "${UDEV_RULE_SRC}" "${UDEV_RULE_DST}"; then
         sudo install -Dm644 "${UDEV_RULE_SRC}" "${UDEV_RULE_DST}"
         sudo udevadm control --reload-rules
-        sudo udevadm trigger /dev/uinput || true
-        ok "udev rule instalada e recarregada."
+        sudo udevadm trigger /dev/uinput 2>/dev/null || true
+        ok "udev rule instalada."
+    else
+        ok "udev rule já presente."
     fi
 
-    # Em alguns casos a regra só pega depois de remover/recarregar o módulo.
-    # Forçamos um reload do módulo se as permissões ainda não bateram.
-    local perms
-    perms=$(stat -c '%a %G' /dev/uinput 2>/dev/null || true)
-    if [[ "${perms}" != "660 input" ]]; then
-        warn "Permissões ainda não estão 660 input — recarregando módulo uinput."
+    # 4) Se permissões ainda não bateram, reload do módulo força a rule a pegar
+    sleep 0.3
+    if ! test_uinput_works; then
+        warn "Permissões não pegaram — recarregando módulo."
         sudo modprobe -r uinput 2>/dev/null || true
+        sleep 0.2
         sudo modprobe uinput
-        sudo udevadm trigger /dev/uinput || true
+        sudo udevadm trigger /dev/uinput 2>/dev/null || true
         sleep 0.3
-        perms=$(stat -c '%a %G' /dev/uinput 2>/dev/null || true)
     fi
 
-    if [[ "${perms}" == "660 input" ]]; then
-        ok "/dev/uinput agora é 660 root:input."
+    # 5) Validação final
+    if test_uinput_works; then
+        ok "/dev/uinput agora acessível."
     else
-        warn "/dev/uinput continua como '${perms}'. Tente reboot ou:"
-        printf "        sudo modprobe -r uinput && sudo modprobe uinput\n"
-    fi
-
-    # checar grupo do usuário
-    if id -nG "$USER" | tr ' ' '\n' | grep -qx input; then
-        ok "Usuário '$USER' já está no grupo 'input'."
-    else
-        warn "Usuário '$USER' NÃO está no grupo 'input'. Rode:"
-        printf "        sudo usermod -aG input %s   # e faça logout/login\n" "$USER"
+        local perms
+        perms=$(stat -c '%a %G' /dev/uinput 2>/dev/null || echo "ausente")
+        fail "/dev/uinput continua inacessível. Estado: ${perms}"
+        fail "Você pode precisar fazer logout/login (se foi adicionado ao grupo input agora)"
+        fail "ou um reboot."
+        return 1
     fi
 }
 
@@ -133,8 +151,7 @@ install_deps() {
 
 do_install() {
     install_deps
-    load_uinput_module
-    install_udev_rule
+    ensure_uinput_works
     install_systemd_unit
     install_desktop_entry
     step "Tudo pronto"
