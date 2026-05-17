@@ -28,6 +28,30 @@ need_pkg() {
     return 0
 }
 
+load_uinput_module() {
+    step "Carregando módulo de kernel 'uinput'"
+    if lsmod | grep -qE '^uinput\b'; then
+        ok "Módulo uinput já está carregado."
+    else
+        sudo modprobe uinput
+        if lsmod | grep -qE '^uinput\b'; then
+            ok "Módulo uinput carregado."
+        else
+            fail "Não foi possível carregar o módulo uinput. Verifique o kernel."
+            exit 1
+        fi
+    fi
+
+    # Persistir entre reboots
+    local modules_conf="/etc/modules-load.d/uinput.conf"
+    if [[ ! -f "${modules_conf}" ]] || ! grep -q '^uinput$' "${modules_conf}" 2>/dev/null; then
+        echo "uinput" | sudo tee "${modules_conf}" >/dev/null
+        ok "Configurado para carregar uinput no boot (${modules_conf})."
+    else
+        ok "uinput já configurado para carregar no boot."
+    fi
+}
+
 install_udev_rule() {
     step "Instalando udev rule (libera /dev/uinput pro grupo 'input')"
     if [[ -r "${UDEV_RULE_DST}" ]] && cmp -s "${UDEV_RULE_SRC}" "${UDEV_RULE_DST}"; then
@@ -35,17 +59,28 @@ install_udev_rule() {
     else
         sudo install -Dm644 "${UDEV_RULE_SRC}" "${UDEV_RULE_DST}"
         sudo udevadm control --reload-rules
-        sudo udevadm trigger /dev/uinput
+        sudo udevadm trigger /dev/uinput || true
         ok "udev rule instalada e recarregada."
     fi
 
-    # validar permissões
+    # Em alguns casos a regra só pega depois de remover/recarregar o módulo.
+    # Forçamos um reload do módulo se as permissões ainda não bateram.
     local perms
     perms=$(stat -c '%a %G' /dev/uinput 2>/dev/null || true)
+    if [[ "${perms}" != "660 input" ]]; then
+        warn "Permissões ainda não estão 660 input — recarregando módulo uinput."
+        sudo modprobe -r uinput 2>/dev/null || true
+        sudo modprobe uinput
+        sudo udevadm trigger /dev/uinput || true
+        sleep 0.3
+        perms=$(stat -c '%a %G' /dev/uinput 2>/dev/null || true)
+    fi
+
     if [[ "${perms}" == "660 input" ]]; then
         ok "/dev/uinput agora é 660 root:input."
     else
-        warn "/dev/uinput está como '${perms}' — pode precisar replugar o mouse ou reboot."
+        warn "/dev/uinput continua como '${perms}'. Tente reboot ou:"
+        printf "        sudo modprobe -r uinput && sudo modprobe uinput\n"
     fi
 
     # checar grupo do usuário
@@ -98,6 +133,7 @@ install_deps() {
 
 do_install() {
     install_deps
+    load_uinput_module
     install_udev_rule
     install_systemd_unit
     install_desktop_entry
