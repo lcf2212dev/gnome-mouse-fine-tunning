@@ -1,0 +1,14 @@
+{
+  "name": "Adaptativa",
+  "description": "Comportamento padrão do GNOME (libinput adaptive). Quando selecionado, o daemon NÃO intercepta o mouse — a aceleração é aplicada pelo sistema.",
+  "builtin": true,
+  "system_default": true,
+  "order": -1,
+  "curve": {
+    "sensitivity": 1.0,
+    "gain": 0.0,
+    "power": 1.0,
+    "deadzone": 0.0,
+    "max_multiplier": 1.0
+  }
+}

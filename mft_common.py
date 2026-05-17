@@ -38,6 +38,17 @@ DEFAULT_CURVE = {
 
 _NAME_RE = re.compile(r"[^A-Za-z0-9 _\-]")
 
+# Preset especial que representa "deixar o sistema fazer" (sem curva customizada).
+# Quando este preset está ativo, o daemon não intercepta nenhum mouse e o
+# accel-profile fica em "adaptive" (padrão do GNOME).
+SYSTEM_DEFAULT_PRESET = "Adaptativa"
+
+
+def is_system_default(preset_or_name) -> bool:
+    if isinstance(preset_or_name, dict):
+        return bool(preset_or_name.get("system_default")) or preset_or_name.get("name") == SYSTEM_DEFAULT_PRESET
+    return preset_or_name == SYSTEM_DEFAULT_PRESET
+
 
 # ---------- curva math ----------
 
@@ -107,6 +118,7 @@ def _load_preset_file(path: Path, builtin: bool) -> dict | None:
         "name": name,
         "description": data.get("description", ""),
         "builtin": builtin,
+        "system_default": bool(data.get("system_default")),
         "order": data.get("order", 999),
         "curve": curve,
         "_path": path,

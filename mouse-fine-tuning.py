@@ -836,13 +836,24 @@ class PresetsPage:
             return GLib.SOURCE_REMOVE
         if not daemon_unit_exists():
             return GLib.SOURCE_REMOVE
+
+        # Caso especial: Adaptativa (sistema padrão) — aplica imediatamente,
+        # sem probe. apply_preset_to_in_use vai disable_curve_everywhere +
+        # accel-profile=adaptive, fazendo o GNOME assumir o controle.
+        if mft_common.is_system_default(preset):
+            self.window.apply_preset_to_in_use(preset["name"], set())
+            if self.window.ipc.connected:
+                self.window.ipc.request_device_list()
+            return GLib.SOURCE_REMOVE
+
+        # Curva customizada: precisa do daemon rodando + probe pra saber em
+        # qual(is) mouse(s) aplicar.
         if not daemon_active():
             daemon_start()
 
         def worker():
             in_use = self.window.detect_in_use_now(timeout=3.0)
             if not in_use:
-                # Sem movimento: aguarda detecção periódica. Não aplica nada.
                 return
             GLib.idle_add(self._finish_auto_apply, preset["name"], in_use)
 
@@ -1095,15 +1106,22 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
         return result
 
     def apply_preset_to_in_use(self, preset_name: str, in_use_ids: set[str]) -> int:
-        """Marca enabled=true + preset=preset_name nos mouses em uso;
-        marca enabled=false nos demais. Retorna quantos foram habilitados."""
+        """Aplica preset aos mouses em uso.
+
+        Comportamento especial para o preset 'Adaptativa' (sistema padrão):
+        nenhum mouse é interceptado (daemon não faz grab) e accel-profile
+        volta a 'adaptive'. O GNOME aplica sua própria aceleração natural.
+        """
+        if mft_common.is_system_default(preset_name):
+            self.disable_curve_everywhere()
+            self.settings.set_string("accel-profile", "adaptive")
+            return 0
+
         cfg = mft_common.load_devices_config()
-        # garantir que todos os in_use estão na config
         present = {m["id"]: m["name"] for m in mft_common.enumerate_present_mice()}
         for did in in_use_ids:
             if did in present:
                 mft_common.upsert_device(cfg, did, present[did])
-        # aplicar
         n = 0
         for d in cfg.get("devices", []):
             if d["id"] in in_use_ids:
@@ -1113,7 +1131,7 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
             else:
                 d["enabled"] = False
         mft_common.save_devices_config(cfg)
-        # forçar accel-profile=flat
+        # curva customizada substitui aceleração nativa
         self.settings.set_string("accel-profile", "flat")
         daemon_reload()
         return n
