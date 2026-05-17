@@ -200,9 +200,13 @@ def _is_mouselike(dev) -> bool:
         import evdev as _evdev  # type: ignore
     except ImportError:
         return False
-    # filtrar nossos próprios virtuais
+    # Filtrar nossos próprios virtuais — UInput do python-evdev sempre tem
+    # phys 'py-evdev-uinput'. Também filtra pelo sufixo no nome.
+    phys = getattr(dev, "phys", "") or ""
+    if phys == "py-evdev-uinput":
+        return False
     name = getattr(dev, "name", "") or ""
-    if name.startswith("MFT Virtual"):
+    if "(mft-virtual)" in name or name.startswith("MFT Virtual"):
         return False
     caps = dev.capabilities()
     rels = caps.get(_evdev.ecodes.EV_REL, [])

@@ -80,12 +80,15 @@ class DeviceHandler:
 
         caps = source.capabilities(verbose=False)
         caps.pop(ec.EV_SYN, None)
+        # Copia vendor/product/version do mouse físico — Mutter precisa ver
+        # o virtual como um mouse "real" pra rotear cursor através dele.
+        # Adiciona sufixo no nome pra distinguir do físico nos logs.
         self.virtual = UInput(
             caps,
-            name=f"MFT Virtual {self.device_id}",
-            vendor=0x1D6B,
-            product=0x0104,
-            version=0x0001,
+            name=f"{source.name} (mft-virtual)",
+            vendor=source.info.vendor,
+            product=source.info.product,
+            version=source.info.version,
         )
 
         # estado
@@ -110,6 +113,8 @@ class DeviceHandler:
             log(f"Erro lendo {self.device_id}: {e}")
             self.fleet.remove_handler(self.device_id)
             return
+        if os.environ.get("MFT_DEBUG"):
+            log(f"[{self.device_id}] batch de {len(batch)} eventos")
         self._process_batch(batch)
 
     def _process_batch(self, events) -> None:
@@ -148,6 +153,7 @@ class DeviceHandler:
 
         mag = math.hypot(self.accum_dx, self.accum_dy)
         speed_in = mag / dt
+        in_dx, in_dy = self.accum_dx, self.accum_dy
         out_dx, out_dy = mft_common.apply_curve(
             self.accum_dx, self.accum_dy, speed_in, self.curve
         )
@@ -164,6 +170,10 @@ class DeviceHandler:
             self.virtual.write(ec.EV_REL, ec.REL_X, int_dx)
         if int_dy:
             self.virtual.write(ec.EV_REL, ec.REL_Y, int_dy)
+
+        if os.environ.get("MFT_DEBUG"):
+            log(f"[{self.device_id}] in=({in_dx},{in_dy}) speed={speed_in:.0f}px/s "
+                f"-> out=({out_dx:.2f},{out_dy:.2f}) emit=({int_dx},{int_dy})")
 
         self.accum_dx = 0
         self.accum_dy = 0

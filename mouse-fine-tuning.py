@@ -698,10 +698,8 @@ class PresetsPage:
 
         self.preview.set_curve(preset["curve"])
 
-        # Auto-apply DESLIGADO temporariamente (bug travava o mouse).
-        # if previous != preset["name"]:
-        #     self.schedule_auto_apply()
-        _ = previous  # noqa
+        if previous != preset["name"]:
+            self.schedule_auto_apply()
 
     # ----- editing -----
 
@@ -921,16 +919,34 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
 
         # Limpa mouses ausentes/históricos do devices.json antes de tudo
         self.cleanup_devices_config()
+        daemon_reload()
+
+        # Fallback adaptive (só se accel-profile estiver em 'default')
+        if self.settings.get_string("accel-profile") == "default":
+            self.settings.set_string("accel-profile", "adaptive")
 
         self._build_ui()
         self._install_actions()
         self.refresh_all()
         GLib.timeout_add_seconds(3, self._periodic_tick)
 
-        # AUTO-APPLY DESLIGADO temporariamente — bug travava o mouse físico
-        # ao fazer grab+re-emit. O app abre como visualizador (edita presets
-        # mas NÃO inicia o daemon nem força flat). Para ativar manualmente,
-        # rode:  systemctl --user enable --now mouse-curve-daemon.service
+        # Auto-apply silencioso ao boot + a cada 8s
+        self.presets_page.schedule_auto_apply()
+        GLib.timeout_add_seconds(8, self._periodic_redetect)
+
+    def _periodic_redetect(self) -> bool:
+        """A cada 8s, probe leve pra detectar mouses novos."""
+        def worker():
+            probed = mft_common.probe_mouse_activity(timeout=0.4)
+            new_movers = {did for did, in_use in probed.items() if in_use}
+            current = set(self.daemon_active_devices)
+            new_in_use = current | new_movers
+            if new_in_use and new_in_use != current:
+                preset = self.active_preset_name
+                if preset:
+                    GLib.idle_add(self.apply_preset_to_in_use, preset, new_in_use)
+        threading.Thread(target=worker, daemon=True).start()
+        return GLib.SOURCE_CONTINUE
 
     # ----- presets/devices state -----
 
