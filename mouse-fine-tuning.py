@@ -618,27 +618,45 @@ class PresetsPage:
         preview_group.add(host)
         self.page.add(preview_group)
 
-        # ----- grupo: aplicar curva (visível só pra presets não-Adaptativa) -----
-        self.apply_group = Adw.PreferencesGroup(
-            title="Ativar curva",
+        # ----- grupo: velocidade do mouse (independente do preset) -----
+        speed_group = Adw.PreferencesGroup(
+            title="Velocidade do mouse",
             description=(
-                "Esta curva customizada substitui a aceleração nativa do GNOME. "
-                "Clique para aplicar — o sistema detecta seu mouse automaticamente. "
-                "Pra voltar ao normal, selecione “Adaptativa” no combo acima."
+                "Velocidade global do ponteiro. Funciona em qualquer preset — "
+                "mesmo em “Adaptativa”. Equivalente ao slider do GNOME."
             ),
         )
-        self.apply_action_row = Adw.ActionRow(
-            title="Status", subtitle="Curva não aplicada"
+        speed_adj = Gtk.Adjustment(
+            lower=-1.0, upper=1.0, step_increment=0.05, page_increment=0.2
         )
-        self.apply_btn = Gtk.Button(
-            label="Aplicar curva",
+        self.window.settings.bind(
+            "speed", speed_adj, "value", Gio.SettingsBindFlags.DEFAULT
+        )
+
+        slider_row = Adw.ActionRow(
+            title="Velocidade do ponteiro",
+            subtitle="Arraste o controle ou use o spin abaixo para ajuste fino",
+        )
+        scale = Gtk.Scale(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            adjustment=speed_adj,
+            hexpand=True,
+            draw_value=False,
             valign=Gtk.Align.CENTER,
         )
-        self.apply_btn.add_css_class("suggested-action")
-        self.apply_btn.connect("clicked", self._on_apply_clicked)
-        self.apply_action_row.add_suffix(self.apply_btn)
-        self.apply_group.add(self.apply_action_row)
-        self.page.add(self.apply_group)
+        scale.set_size_request(260, -1)
+        scale.add_mark(-1.0, Gtk.PositionType.BOTTOM, "Lento")
+        scale.add_mark(0.0, Gtk.PositionType.BOTTOM, "Padrão")
+        scale.add_mark(1.0, Gtk.PositionType.BOTTOM, "Rápido")
+        slider_row.add_suffix(scale)
+        speed_group.add(slider_row)
+
+        spin_speed = Adw.SpinRow(
+            title="Ajuste fino", subtitle="Precisão de 0.05", digits=2
+        )
+        spin_speed.set_adjustment(speed_adj)
+        speed_group.add(spin_speed)
+        self.page.add(speed_group)
 
         # ----- grupo: live monitor -----
         live_group = Adw.PreferencesGroup(
@@ -719,17 +737,9 @@ class PresetsPage:
 
         self.preview.set_curve(preset["curve"])
 
-        # Mostrar/ocultar grupo "Aplicar curva" baseado no preset
-        if hasattr(self, "apply_group"):
-            self.apply_group.set_visible(not is_builtin or not mft_common.is_system_default(preset))
-            # Atualizar texto do status
-            self._refresh_apply_label()
-
+        # Auto-aplica em qualquer mudança de preset (curva ou Adaptativa).
         if previous != preset["name"]:
-            # Adaptativa: re-aplica (libera grabs). Curva customizada: NÃO
-            # aplica automaticamente — usuário clica "Aplicar" manualmente.
-            if mft_common.is_system_default(preset):
-                self.schedule_auto_apply()
+            self.schedule_auto_apply()
 
     # ----- editing -----
 
@@ -847,12 +857,10 @@ class PresetsPage:
         """Recebe lista do daemon via IPC."""
         self._live_devices = [d for d in devices if d.get("present")]
         self._in_use_ids = set(self.window.daemon_active_devices)
-        self._refresh_apply_label()
 
     def refresh_apply_status(self) -> None:
         """Compat: chamado de refresh_all e periodic_tick."""
         self._in_use_ids = set(self.window.daemon_active_devices)
-        self._refresh_apply_label()
 
     def schedule_auto_apply(self) -> None:
         """Agenda uma aplicação automática (debounce 300ms)."""
@@ -861,10 +869,12 @@ class PresetsPage:
         self._auto_apply_timer = GLib.timeout_add(300, self._do_auto_apply)
 
     def _do_auto_apply(self) -> bool:
-        """Auto-apply silencioso: SÓ para o preset Adaptativa (libera grabs).
-        Curvas customizadas NÃO são aplicadas automaticamente — exigem clique
-        explícito no botão 'Aplicar curva' (evita travar o mouse acidentalmente
-        com curvas mal ajustadas)."""
+        """Auto-apply silencioso, dispara em mudança de preset:
+          - Adaptativa: aplica imediatamente (libera grabs, sem probe).
+          - Curva: se já houver mouse interceptado, troca a curva.
+                   Senão, faz probe assíncrono (até 3s) pra detectar mouse
+                   em uso e aplica nele. Fallback: aplica em todos os mouses
+                   presentes."""
         self._auto_apply_timer = None
         preset = self._current_preset()
         if not preset:
@@ -876,55 +886,36 @@ class PresetsPage:
             self.window.apply_preset_to_in_use(preset["name"], set())
             if self.window.ipc.connected:
                 self.window.ipc.request_device_list()
-        return GLib.SOURCE_REMOVE
+            return GLib.SOURCE_REMOVE
 
-    def _on_apply_clicked(self, _btn) -> None:
-        """Botão 'Aplicar curva' — só aparece pra presets não-Adaptativa."""
-        preset = self._current_preset()
-        if not preset:
-            return
-        if mft_common.is_system_default(preset):
-            return
-        if not daemon_unit_exists():
-            self.window.toast("Daemon não instalado — rode ./setup.sh install")
-            return
+        # Curva customizada
         if not daemon_active():
             daemon_start()
-        self.apply_btn.set_sensitive(False)
-        self.apply_action_row.set_subtitle("Detectando mouse em uso (mexa o mouse)…")
 
+        already_active = set(self.window.daemon_active_devices)
+        if already_active:
+            # Troca curva nos mouses já interceptados — instantâneo
+            self.window.apply_preset_to_in_use(preset["name"], already_active)
+            if self.window.ipc.connected:
+                self.window.ipc.request_device_list()
+            return GLib.SOURCE_REMOVE
+
+        # Nenhum mouse interceptado ainda — detectar via probe
         def worker():
-            in_use = self.window.detect_in_use_now(timeout=2.0)
+            in_use = self.window.detect_in_use_now(timeout=3.0)
             if not in_use:
-                # Fallback: aplicar a todos os mouses presentes
+                # Fallback: aplica em todos os mouses presentes
                 in_use = {m["id"] for m in mft_common.enumerate_present_mice()}
-            GLib.idle_add(self._finish_apply, preset["name"], in_use)
+            GLib.idle_add(self._finish_auto_apply, preset["name"], in_use)
 
         threading.Thread(target=worker, daemon=True).start()
+        return GLib.SOURCE_REMOVE
 
-    def _finish_apply(self, preset_name: str, in_use: set[str]) -> bool:
-        n = self.window.apply_preset_to_in_use(preset_name, in_use)
-        self.apply_btn.set_sensitive(True)
-        if n > 0:
-            self.window.toast(f"Curva “{preset_name}” aplicada a {n} mouse(s)")
-        else:
-            self.window.toast("Nenhum mouse detectado")
-        self._refresh_apply_label()
+    def _finish_auto_apply(self, preset_name: str, in_use: set[str]) -> bool:
+        self.window.apply_preset_to_in_use(preset_name, in_use)
         if self.window.ipc.connected:
             self.window.ipc.request_device_list()
         return False
-
-    def _refresh_apply_label(self) -> None:
-        """Atualiza o subtítulo do row 'Status' baseado no estado do daemon."""
-        if not hasattr(self, "apply_action_row"):
-            return
-        active = self.window.daemon_active_devices
-        if active:
-            self.apply_action_row.set_subtitle(
-                f"Aplicada · interceptando {len(active)} mouse(s)"
-            )
-        else:
-            self.apply_action_row.set_subtitle("Curva não aplicada")
 
     # ----- live monitor -----
 
@@ -1155,37 +1146,18 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
     def apply_preset_to_in_use(self, preset_name: str, in_use_ids: set[str]) -> int:
         """Aplica preset aos mouses em uso.
 
-        Quando curva customizada é ativada (preset != Adaptativa), o app:
-          - Salva o `gsettings speed` atual em `saved_native_speed` (se ainda
-            não estava salvo) — só na transição Adaptativa → custom.
-          - Força `speed = 0.0` (neutro) pra que o multiplicador do compositor
-            não amplifique/atenue a curva customizada.
-          - Força `accel-profile = flat` — só a curva customizada age.
+        - Adaptativa: nenhum mouse interceptado, `accel-profile=adaptive`.
+        - Custom: mouses em `in_use_ids` ficam enabled=true; `accel-profile=flat`.
 
-        Quando volta pra Adaptativa:
-          - Restaura `speed` salvo (se houver).
-          - Limpa o campo `saved_native_speed` no devices.json.
-          - `accel-profile = adaptive` (GNOME volta a aplicar curva nativa).
+        O `gsettings speed` NÃO é tocado por essa função — é controlado pelo
+        slider de velocidade do app (ligado diretamente ao gsettings).
         """
-        cfg = mft_common.load_devices_config()
-
         if mft_common.is_system_default(preset_name):
             self.disable_curve_everywhere()
-            # restaura speed se houver valor salvo
-            saved = mft_common.get_saved_speed(cfg)
-            if saved is not None:
-                self.settings.set_double("speed", saved)
-                mft_common.set_saved_speed(cfg, None)
-                mft_common.save_devices_config(cfg)
             self.settings.set_string("accel-profile", "adaptive")
             return 0
 
-        # Curva customizada: salvar speed atual (se ainda não salvo) e forçar 0
-        if mft_common.get_saved_speed(cfg) is None:
-            current_speed = self.settings.get_double("speed")
-            mft_common.set_saved_speed(cfg, current_speed)
-        self.settings.set_double("speed", 0.0)
-
+        cfg = mft_common.load_devices_config()
         present = {m["id"]: m["name"] for m in mft_common.enumerate_present_mice()}
         for did in in_use_ids:
             if did in present:
