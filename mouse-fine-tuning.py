@@ -543,6 +543,8 @@ class PresetsPage:
         sel_group.add(self.description_row)
 
         action_row = Adw.ActionRow(title="Ações")
+        self.new_btn = Gtk.Button(label="Novo", valign=Gtk.Align.CENTER)
+        self.new_btn.connect("clicked", self._on_new)
         self.duplicate_btn = Gtk.Button(label="Duplicar", valign=Gtk.Align.CENTER)
         self.duplicate_btn.connect("clicked", self._on_duplicate)
         self.rename_btn = Gtk.Button(label="Renomear", valign=Gtk.Align.CENTER)
@@ -551,6 +553,7 @@ class PresetsPage:
         self.delete_btn.add_css_class("destructive-action")
         self.delete_btn.connect("clicked", self._on_delete)
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.append(self.new_btn)
         box.append(self.duplicate_btn)
         box.append(self.rename_btn)
         box.append(self.delete_btn)
@@ -778,7 +781,39 @@ class PresetsPage:
         daemon_reload()
         return GLib.SOURCE_REMOVE
 
-    # ----- duplicate / rename / delete -----
+    # ----- new / duplicate / rename / delete -----
+
+    def _on_new(self, _btn) -> None:
+        """Abre dialog pra nomear um novo preset custom com curva default."""
+        dlg = Adw.AlertDialog(
+            heading="Novo preset",
+            body="Crie um preset customizado vazio. Os parâmetros começam com valores padrão e podem ser editados depois.",
+        )
+        entry = Gtk.Entry(placeholder_text="Nome do novo preset")
+        dlg.set_extra_child(entry)
+        dlg.add_response("cancel", "Cancelar")
+        dlg.add_response("create", "Criar")
+        dlg.set_response_appearance("create", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("create")
+        dlg.set_close_response("cancel")
+
+        def on_response(_dlg, response):
+            if response != "create":
+                return
+            name = entry.get_text().strip()
+            if not name:
+                self.window.toast("Nome não pode estar vazio")
+                return
+            existing = {p["name"] for p in self.window.presets}
+            if name in existing:
+                self.window.toast(f"Já existe um preset chamado “{name}”")
+                return
+            mft_common.save_custom_preset(name, "", dict(mft_common.DEFAULT_CURVE))
+            self.window.reload_presets(keep_selection=name)
+            daemon_reload()
+
+        dlg.connect("response", on_response)
+        dlg.present(self.window)
 
     def _on_duplicate(self, _btn) -> None:
         preset = self._current_preset()
