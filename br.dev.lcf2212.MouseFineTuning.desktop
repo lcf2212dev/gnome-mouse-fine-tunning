@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Mouse Fine-Tuning
+Name[pt_BR]=Ajuste Fino do Mouse
+GenericName=Mouse Settings
+GenericName[pt_BR]=Configurações do Mouse
+Comment=Configure pointer speed, acceleration profile and drag threshold
+Comment[pt_BR]=Configure velocidade, perfil de aceleração e limiar de arrasto do ponteiro
+Exec=python3 /home/workstation/PersonalDevelopment/gnome-apps/mouse-fine-tinning/mouse-fine-tuning.py
+Icon=input-mouse-symbolic
+Terminal=false
+Categories=Settings;GNOME;GTK;HardwareSettings;
+Keywords=mouse;pointer;speed;acceleration;ponteiro;velocidade;aceleração;
+StartupNotify=true
