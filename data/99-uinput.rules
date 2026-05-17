@@ -1,0 +1,3 @@
+# Allow members of the "input" group to write to /dev/uinput.
+# Required by mouse-curve-daemon to create the virtual mouse device.
+KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
