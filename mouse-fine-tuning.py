@@ -186,6 +186,7 @@ class LiveMonitor(Gtk.DrawingArea):
 
     WINDOW_SECONDS = 5.0
     BUFFER_SIZE = 600  # ~30 Hz × 5s × margem
+    TICK_INTERVAL_MS = 50  # 20 Hz heartbeat — timeline sempre rola
 
     def __init__(self) -> None:
         super().__init__()
@@ -194,9 +195,8 @@ class LiveMonitor(Gtk.DrawingArea):
         self.set_draw_func(self._on_draw)
         self.samples: collections.deque = collections.deque(maxlen=self.BUFFER_SIZE)
         self.active = False
-        self.empty_message = (
-            "Mover o mouse selecionado para ver o efeito da curva ao vivo."
-        )
+        self.empty_message = "Mexa o mouse para ver o efeito da curva ao vivo."
+        self._tick_id: int | None = None
 
     def add_sample(self, t: float, speed_in: float, speed_out: float) -> None:
         self.samples.append((t, speed_in, speed_out))
@@ -207,9 +207,27 @@ class LiveMonitor(Gtk.DrawingArea):
         self.queue_draw()
 
     def set_active(self, active: bool) -> None:
+        if self.active == active:
+            return
         self.active = active
-        if not active:
+        if active and self._tick_id is None:
+            self._tick_id = GLib.timeout_add(self.TICK_INTERVAL_MS, self._tick)
+        elif not active and self._tick_id is not None:
+            GLib.source_remove(self._tick_id)
+            self._tick_id = None
             self.reset()
+
+    def _tick(self) -> bool:
+        """Heartbeat: garante que a timeline rola mesmo sem movimento real."""
+        if not self.active:
+            return GLib.SOURCE_REMOVE
+        now = time.monotonic()
+        # se há pouco tempo desde a última sample (real ou sintética), pular
+        if not self.samples or (now - self.samples[-1][0]) > self.TICK_INTERVAL_MS / 1000.0:
+            self.add_sample(now, 0.0, 0.0)
+        else:
+            self.queue_draw()
+        return GLib.SOURCE_CONTINUE
 
     def _on_draw(self, _area, cr, width, height) -> None:
         margin_l, margin_r, margin_t, margin_b = 46, 14, 16, 22
@@ -600,34 +618,6 @@ class PresetsPage:
         preview_group.add(host)
         self.page.add(preview_group)
 
-        # ----- grupo: aplicação ao mouse em uso -----
-        apply_group = Adw.PreferencesGroup(
-            title="Aplicação",
-            description=(
-                "Liga o switch pra aplicar este preset ao(s) seu(s) mouse(s) "
-                "ativo(s) no momento. O sistema detecta automaticamente."
-            ),
-        )
-        self.apply_status_row = Adw.ActionRow(
-            title="Mouse em uso", subtitle="—"
-        )
-        redetect_btn = Gtk.Button(
-            label="Re-detectar",
-            valign=Gtk.Align.CENTER,
-            tooltip_text="Probar atividade do mouse novamente (~1.5s — mexa o mouse)",
-        )
-        redetect_btn.add_css_class("flat")
-        redetect_btn.connect("clicked", self._on_redetect_clicked)
-        self.apply_status_row.add_suffix(redetect_btn)
-        apply_group.add(self.apply_status_row)
-
-        self.apply_switch = Adw.SwitchRow(
-            title="Aplicar curva no meu mouse",
-            subtitle="Ativa o daemon e aplica este preset ao(s) mouse(s) em uso.",
-        )
-        self.apply_switch.connect("notify::active", self._on_apply_toggle)
-        apply_group.add(self.apply_switch)
-        self.page.add(apply_group)
 
         # ----- grupo: live monitor -----
         live_group = Adw.PreferencesGroup(
@@ -708,11 +698,9 @@ class PresetsPage:
 
         self.preview.set_curve(preset["curve"])
 
-        # Se switch "Aplicar" estiver ligado e mudou o preset, re-aplicar
-        if previous != preset["name"] and self.apply_switch.get_active():
-            in_use = self._in_use_ids or set(self.window.daemon_active_devices)
-            if in_use:
-                self.window.apply_preset_to_in_use(preset["name"], in_use)
+        # Auto-apply: ao trocar de preset, re-aplica a curva nova no(s) mouse(s) em uso
+        if previous != preset["name"]:
+            self.schedule_auto_apply()
 
     # ----- editing -----
 
@@ -824,97 +812,49 @@ class PresetsPage:
         dlg.connect("response", on_response)
         dlg.present(self.window)
 
-    # ----- aplicação / detecção -----
+    # ----- aplicação / detecção (sempre on, oculto ao usuário) -----
 
     def update_devices(self, devices: list[dict]) -> None:
-        """Recebe lista do daemon via IPC. Atualiza estado do switch e status row."""
+        """Recebe lista do daemon via IPC."""
         self._live_devices = [d for d in devices if d.get("present")]
-        self.refresh_apply_status()
+        self._in_use_ids = set(self.window.daemon_active_devices)
 
     def refresh_apply_status(self) -> None:
-        """Atualiza Mouse-em-uso row e estado do switch Aplicar baseado no daemon."""
-        # mouse(s) em uso = ativos no daemon ∪ probed_activity
-        in_use = set(self.window.daemon_active_devices)
-        # se nada ativo no daemon, exibe nomes só dos presentes
-        present_by_id = {d["id"]: d["name"] for d in self._live_devices}
+        """Compat: chamado de refresh_all e periodic_tick — só sincroniza estado."""
+        self._in_use_ids = set(self.window.daemon_active_devices)
 
-        if in_use:
-            self._in_use_ids = in_use
-            names = [present_by_id.get(d, d) for d in sorted(in_use)]
-            self.apply_status_row.set_subtitle(", ".join(names))
-        elif present_by_id:
-            self._in_use_ids = set()
-            self.apply_status_row.set_subtitle(
-                "nenhum movimento detectado · "
-                + ", ".join(present_by_id.values())
-                + " (mexa o mouse e clique Re-detectar)"
-            )
-        else:
-            self._in_use_ids = set()
-            self.apply_status_row.set_subtitle("(nenhum mouse presente)")
+    def schedule_auto_apply(self) -> None:
+        """Agenda uma aplicação automática (debounce 300ms)."""
+        if getattr(self, "_auto_apply_timer", None) is not None:
+            GLib.source_remove(self._auto_apply_timer)
+        self._auto_apply_timer = GLib.timeout_add(300, self._do_auto_apply)
 
-        # Switch reflete estado do daemon
-        self._suppressing = True
-        try:
-            self.apply_switch.set_active(bool(in_use))
-        finally:
-            self._suppressing = False
+    def _do_auto_apply(self) -> bool:
+        """Detecta mouse em uso (probe assíncrono) e aplica preset selecionado."""
+        self._auto_apply_timer = None
+        preset = self._current_preset()
+        if not preset:
+            return GLib.SOURCE_REMOVE
+        if not daemon_unit_exists():
+            return GLib.SOURCE_REMOVE
+        if not daemon_active():
+            daemon_start()
 
-    def _on_redetect_clicked(self, _btn) -> None:
-        # Probe síncrono curto (1.5s). Pode bloquear UI brevemente — aceitável.
-        in_use = self.window.detect_in_use_now(timeout=1.5)
-        # Se o switch estava on, aplica o preset novo aos mouses recém-detectados
-        if self.apply_switch.get_active():
-            preset = self._current_preset()
-            if preset:
-                self.window.apply_preset_to_in_use(preset["name"], in_use)
-        else:
-            # Só atualiza display
-            self._in_use_ids = in_use
-            self.refresh_apply_status()
-        # Solicita nova lista do daemon (ele vai refletir as mudanças)
-        if self.window.ipc.connected:
-            self.window.ipc.request_device_list()
-
-    def _on_apply_toggle(self, switch, _pspec) -> None:
-        if self._suppressing:
-            return
-        if switch.get_active():
-            preset = self._current_preset()
-            if not preset:
-                switch.set_active(False)
-                return
-            if not daemon_unit_exists():
-                self.window.toast("Daemon não instalado — rode ./setup.sh install")
-                self._suppressing = True
-                try:
-                    switch.set_active(False)
-                finally:
-                    self._suppressing = False
-                return
-            # Garantir daemon iniciado
-            if not daemon_active():
-                daemon_start()
-            # Probe síncrono pra detectar mouses em uso
-            in_use = self.window.detect_in_use_now(timeout=1.5)
+        def worker():
+            in_use = self.window.detect_in_use_now(timeout=3.0)
             if not in_use:
-                self.window.toast(
-                    "Nenhum mouse em movimento detectado. Mexa o mouse e tente de novo."
-                )
-                self._suppressing = True
-                try:
-                    switch.set_active(False)
-                finally:
-                    self._suppressing = False
+                # Sem movimento: aguarda detecção periódica. Não aplica nada.
                 return
-            n = self.window.apply_preset_to_in_use(preset["name"], in_use)
-            self.window.toast(
-                f"Curva “{preset['name']}” aplicada a {n} mouse(s)."
-            )
-        else:
-            self.window.disable_curve_everywhere()
+            GLib.idle_add(self._finish_auto_apply, preset["name"], in_use)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return GLib.SOURCE_REMOVE
+
+    def _finish_auto_apply(self, preset_name: str, in_use: set[str]) -> bool:
+        self.window.apply_preset_to_in_use(preset_name, in_use)
         if self.window.ipc.connected:
             self.window.ipc.request_device_list()
+        return False
 
     # ----- live monitor -----
 
@@ -983,10 +923,38 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
         # Sinaliza o daemon pra recarregar (caso cleanup tenha removido devices)
         daemon_reload()
 
+        # Aceleração nativa: garantir 'adaptive' como fallback quando a curva
+        # customizada não estiver ativa. Não sobrescreve se o usuário tinha
+        # outro valor explícito (flat ou adaptive já configurado).
+        if self.settings.get_string("accel-profile") == "default":
+            self.settings.set_string("accel-profile", "adaptive")
+
         self._build_ui()
         self._install_actions()
         self.refresh_all()
         GLib.timeout_add_seconds(3, self._periodic_tick)
+
+        # Auto-aplica preset ao mouse em uso no boot (oculto ao usuário)
+        self.presets_page.schedule_auto_apply()
+        # Re-detecta periodicamente caso o user comece a mexer outro mouse
+        GLib.timeout_add_seconds(8, self._periodic_redetect)
+
+    def _periodic_redetect(self) -> bool:
+        """A cada 8s, faz um probe leve pra detectar mouses novos.
+        Se o conjunto de mouses em uso mudou, re-aplica o preset (auto-adapta).
+        Devices já interceptados pelo daemon não vão acusar evento no probe
+        (grab exclusivo), então o conjunto efetivo = ativos no daemon ∪ probed."""
+        def worker():
+            probed = mft_common.probe_mouse_activity(timeout=0.4)
+            new_movers = {did for did, in_use in probed.items() if in_use}
+            current = set(self.daemon_active_devices)
+            new_in_use = current | new_movers
+            if new_in_use and new_in_use != current:
+                preset = self.active_preset_name
+                if preset:
+                    GLib.idle_add(self.apply_preset_to_in_use, preset, new_in_use)
+        threading.Thread(target=worker, daemon=True).start()
+        return GLib.SOURCE_CONTINUE
 
     # ----- presets/devices state -----
 
@@ -1032,6 +1000,7 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
         toolbar = Adw.ToolbarView()
 
         header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle.new("Mouse Fine-Tuning", ""))
         menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic")
         menu_button.set_tooltip_text("Menu principal")
         menu = Gio.Menu()
@@ -1040,23 +1009,10 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
         menu_button.set_menu_model(menu)
         header.pack_end(menu_button)
 
-        self.view_stack = Adw.ViewStack()
-        self.basic_page = BasicPage(self.settings)
         self.presets_page = PresetsPage(self)
-        self.view_stack.add_titled_with_icon(
-            self.basic_page.page, "basic", "Configurações", "input-mouse-symbolic"
-        )
-        self.view_stack.add_titled_with_icon(
-            self.presets_page.page, "presets", "Presets", "preferences-other-symbolic"
-        )
-
-        switcher = Adw.ViewSwitcher()
-        switcher.set_stack(self.view_stack)
-        switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
-        header.set_title_widget(switcher)
 
         toolbar.add_top_bar(header)
-        self._toast_overlay.set_child(self.view_stack)
+        self._toast_overlay.set_child(self.presets_page.page)
         toolbar.set_content(self._toast_overlay)
         self.set_content(toolbar)
 
