@@ -525,7 +525,7 @@ class PresetsPage:
     def __init__(self, window: MouseFineTuningWindow) -> None:
         self.window = window
         self.page = Adw.PreferencesPage()
-        self._save_timer_id: int | None = None
+        # (debounce de save removido — agora há botão Salvar explícito)
         self._suppressing = False
 
         # ----- grupo: seleção -----
@@ -600,7 +600,31 @@ class PresetsPage:
             adj.connect("value-changed", self._on_param_changed)
             params_group.add(r)
             self.param_rows.append(r)
+
+        # Botões Salvar/Descartar — só ficam habilitados quando há mudanças
+        # pendentes em um preset custom (built-ins são read-only).
+        self.save_status_row = Adw.ActionRow(
+            title="Estado",
+            subtitle="Sem mudanças pendentes",
+        )
+        self.discard_btn = Gtk.Button(
+            label="Descartar", valign=Gtk.Align.CENTER, sensitive=False
+        )
+        self.discard_btn.connect("clicked", self._on_discard)
+        self.save_btn = Gtk.Button(
+            label="Salvar", valign=Gtk.Align.CENTER, sensitive=False
+        )
+        self.save_btn.add_css_class("suggested-action")
+        self.save_btn.connect("clicked", self._on_save)
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_box.append(self.discard_btn)
+        btn_box.append(self.save_btn)
+        self.save_status_row.add_suffix(btn_box)
+        params_group.add(self.save_status_row)
+
         self.page.add(params_group)
+
+        self.dirty = False  # True se há mudanças não salvas
 
         # ----- grupo: preview -----
         preview_group = Adw.PreferencesGroup(
@@ -739,6 +763,9 @@ class PresetsPage:
             self._suppressing = False
 
         self.preview.set_curve(preset["curve"])
+        # Reseta estado de "mudanças não salvas" ao trocar de preset
+        if hasattr(self, "save_btn"):
+            self._set_dirty(False)
 
         # Auto-aplica em qualquer mudança de preset (curva ou Adaptativa).
         if previous != preset["name"]:
@@ -756,6 +783,9 @@ class PresetsPage:
         }
 
     def _on_param_changed(self, _adj) -> None:
+        """Apenas atualiza o preview e marca dirty. NÃO salva no disco nem
+        notifica o daemon — isso só acontece quando o usuário clica em
+        'Salvar' (evita o mouse 'parar' durante a edição)."""
         if self._suppressing:
             return
         preset = self._current_preset()
@@ -763,23 +793,52 @@ class PresetsPage:
             return
         curve = self._current_curve_from_sliders()
         self.preview.set_curve(curve)
-        # debounce 400ms
-        if self._save_timer_id:
-            GLib.source_remove(self._save_timer_id)
-        self._save_timer_id = GLib.timeout_add(400, self._commit_curve_change)
+        self._set_dirty(True)
 
-    def _commit_curve_change(self) -> bool:
-        self._save_timer_id = None
+    def _set_dirty(self, dirty: bool) -> None:
+        self.dirty = dirty
+        is_builtin = bool(self._current_preset() and self._current_preset()["builtin"])
+        self.save_btn.set_sensitive(dirty and not is_builtin)
+        self.discard_btn.set_sensitive(dirty and not is_builtin)
+        if is_builtin:
+            self.save_status_row.set_subtitle("Built-in — somente leitura. Duplique para editar.")
+        elif dirty:
+            self.save_status_row.set_subtitle("Mudanças não salvas — clique Salvar para aplicar")
+            self.save_status_row.add_css_class("warning")
+        else:
+            self.save_status_row.set_subtitle("Sem mudanças pendentes")
+            self.save_status_row.remove_css_class("warning")
+
+    def _on_save(self, _btn) -> None:
         preset = self._current_preset()
         if not preset or preset["builtin"]:
-            return GLib.SOURCE_REMOVE
+            return
         curve = self._current_curve_from_sliders()
         mft_common.save_custom_preset(
             preset["name"], preset.get("description", ""), curve
         )
         self.window.reload_presets(keep_selection=preset["name"])
         daemon_reload()
-        return GLib.SOURCE_REMOVE
+        self._set_dirty(False)
+        self.window.toast(f"Curva “{preset['name']}” salva")
+
+    def _on_discard(self, _btn) -> None:
+        preset = self._current_preset()
+        if not preset:
+            return
+        # Recarrega sliders com os valores do disco (preset original)
+        self._suppressing = True
+        try:
+            c = preset["curve"]
+            self.sensitivity_adj.set_value(c["sensitivity"])
+            self.gain_adj.set_value(c["gain"])
+            self.power_adj.set_value(c["power"])
+            self.deadzone_adj.set_value(c["deadzone"])
+            self.max_mult_adj.set_value(c["max_multiplier"])
+        finally:
+            self._suppressing = False
+        self.preview.set_curve(preset["curve"])
+        self._set_dirty(False)
 
     # ----- new / duplicate / rename / delete -----
 
