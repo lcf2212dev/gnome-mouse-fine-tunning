@@ -1,0 +1,16 @@
+[Unit]
+Description=Mouse Fine-Tuning custom acceleration curve daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/PersonalDevelopment/gnome-apps/mouse-fine-tinning/mouse-curve-daemon.py
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target
