@@ -1,0 +1,13 @@
+{
+  "name": "Suave",
+  "description": "Como Linear mas com um pouco mais de aceleração em velocidades médias. Bom pra produtividade — clicar em alvos pequenos sem perder agilidade.",
+  "builtin": true,
+  "order": 1,
+  "curve": {
+    "sensitivity": 0.7,
+    "gain": 1.4,
+    "power": 1.1,
+    "deadzone": 10.0,
+    "max_multiplier": 3.0
+  }
+}

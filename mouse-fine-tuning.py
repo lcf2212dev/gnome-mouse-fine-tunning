@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""Mouse Fine-Tuning — configuração visual do mouse para GNOME.
+"""Mouse Fine-Tuning — GUI principal.
 
-Inclui:
-  * Configurações nativas do GNOME via gsettings (velocidade, perfil de
-    aceleração, limiar de arrasto).
-  * Curva de aceleração customizada velocidade-dependente, aplicada por um
-    daemon uinput separado (mouse-curve-daemon). Esta janela edita a curva,
-    salva em ~/.config/mouse-fine-tuning/curve.json e controla o daemon
-    via systemd --user."""
+Três abas:
+  * Configurações — gsettings nativos do GNOME (speed, accel-profile, drag).
+  * Dispositivos  — lista de mouses, switch on/off e dropdown de preset por mouse.
+  * Presets      — editor da biblioteca de presets, preview gráfico, live
+                    monitor (osciloscópio do mouse via IPC com o daemon)."""
 
 from __future__ import annotations
 
+import collections
 import json
 import math
+import socket
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import gi
@@ -24,90 +26,24 @@ gi.require_version("Adw", "1")
 
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
-try:
-    import evdev  # type: ignore
-
-    HAVE_EVDEV = True
-except ImportError:
-    HAVE_EVDEV = False
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mft_common  # noqa: E402
 
 APP_ID = "br.dev.lcf2212.MouseFineTuning"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 SCHEMA = "org.gnome.desktop.peripherals.mouse"
-
-CONFIG_DIR = Path.home() / ".config" / "mouse-fine-tuning"
-CURVE_PATH = CONFIG_DIR / "curve.json"
-
 DAEMON_UNIT = "mouse-curve-daemon.service"
 
 PROFILES = ["default", "flat", "adaptive"]
 PROFILE_LABELS = ["Padrão do sistema", "Desativada (flat)", "Adaptativa"]
 
-DEFAULT_CURVE = {
-    "sensitivity": 1.0,
-    "gain": 0.1,
-    "power": 1.5,
-    "deadzone": 0.0,
-    "max_multiplier": 3.0,
-}
 
-
-# ---------- utilitários de schema e config ----------
+# ====================== utilitários ======================
 
 
 def schema_available() -> bool:
     source = Gio.SettingsSchemaSource.get_default()
     return source is not None and source.lookup(SCHEMA, True) is not None
-
-
-def load_curve_config() -> dict:
-    if not CURVE_PATH.exists():
-        return {"device_path": "", "curve": DEFAULT_CURVE.copy()}
-    try:
-        with CURVE_PATH.open() as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {"device_path": "", "curve": DEFAULT_CURVE.copy()}
-    curve = {**DEFAULT_CURVE, **(data.get("curve") or {})}
-    return {"device_path": data.get("device_path", ""), "curve": curve}
-
-
-def save_curve_config(data: dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = CURVE_PATH.with_suffix(".json.tmp")
-    with tmp.open("w") as f:
-        json.dump(data, f, indent=2)
-    tmp.replace(CURVE_PATH)
-
-
-# ---------- detecção de mouses (opcional, requer evdev) ----------
-
-
-def list_mice() -> list[tuple[str, str]]:
-    """Retorna [(path, friendly_name), ...]. Vazia se evdev não disponível."""
-    if not HAVE_EVDEV:
-        return []
-    found: list[tuple[str, str]] = []
-    for path in evdev.list_devices():
-        try:
-            dev = evdev.InputDevice(path)
-        except OSError:
-            continue
-        caps = dev.capabilities()
-        rels = caps.get(evdev.ecodes.EV_REL, [])
-        if (
-            evdev.ecodes.REL_X in rels
-            and evdev.ecodes.REL_Y in rels
-            and evdev.ecodes.EV_ABS not in caps
-        ):
-            keys = caps.get(evdev.ecodes.EV_KEY, [])
-            if evdev.ecodes.BTN_LEFT in keys or evdev.ecodes.BTN_MOUSE in keys:
-                found.append((path, f"{dev.name} ({path})"))
-        dev.close()
-    return found
-
-
-# ---------- helpers do systemd --user ----------
 
 
 def systemctl(*args: str) -> subprocess.CompletedProcess:
@@ -130,9 +66,7 @@ def daemon_enabled() -> bool:
 def daemon_unit_exists() -> bool:
     return (
         Path.home() / ".config" / "systemd" / "user" / DAEMON_UNIT
-    ).exists() or (
-        Path("/etc/systemd/user") / DAEMON_UNIT
-    ).exists()
+    ).exists() or (Path("/etc/systemd/user") / DAEMON_UNIT).exists()
 
 
 def daemon_start() -> tuple[bool, str]:
@@ -145,206 +79,360 @@ def daemon_stop() -> tuple[bool, str]:
     return res.returncode == 0, (res.stderr or res.stdout).strip()
 
 
-def daemon_reload_config() -> None:
+def daemon_restart() -> tuple[bool, str]:
+    res = systemctl("restart", DAEMON_UNIT)
+    return res.returncode == 0, (res.stderr or res.stdout).strip()
+
+
+def daemon_reload() -> None:
     systemctl("kill", "--signal=HUP", DAEMON_UNIT)
 
 
-# ---------- preview gráfico da curva ----------
+# ====================== preview gráfico da curva ======================
 
 
 class CurvePreview(Gtk.DrawingArea):
     __gtype_name__ = "CurvePreview"
 
-    MAX_SPEED_PPS = 3000.0  # eixo X do gráfico
-    MAX_MULT_DISPLAY_FLOOR = 1.5  # mantém escala mínima do eixo Y
+    MAX_SPEED_PPS = 3000.0
+    MIN_Y_SCALE = 1.5
 
     def __init__(self) -> None:
         super().__init__()
-        self.set_size_request(360, 200)
+        self.set_size_request(380, 200)
         self.set_hexpand(True)
         self.set_draw_func(self._on_draw)
-        self.params = DEFAULT_CURVE.copy()
+        self.curve = dict(mft_common.DEFAULT_CURVE)
 
-    def set_params(self, **kwargs) -> None:
-        self.params.update(kwargs)
+    def set_curve(self, curve: dict) -> None:
+        self.curve = dict(curve)
         self.queue_draw()
 
-    def _multiplier_at(self, speed: float) -> float:
-        effective = max(0.0, speed - self.params["deadzone"])
-        accel = self.params["gain"] * (effective / 1000.0) ** self.params["power"]
-        return min(
-            self.params["sensitivity"] * (1.0 + accel),
-            self.params["max_multiplier"],
-        )
-
     def _on_draw(self, _area, cr, width, height) -> None:
-        margin_left = 44
-        margin_right = 12
-        margin_top = 14
-        margin_bottom = 28
-        plot_w = width - margin_left - margin_right
-        plot_h = height - margin_top - margin_bottom
+        margin_l, margin_r, margin_t, margin_b = 46, 14, 16, 30
+        pw = width - margin_l - margin_r
+        ph = height - margin_t - margin_b
+        if pw < 20 or ph < 20:
+            return
 
-        style = self.get_style_context()
-        fg_color = style.get_color()
+        fg = self.get_style_context().get_color()
 
-        # fundo: card transparente, deixa o tema cuidar
         # eixos
-        cr.set_source_rgba(fg_color.red, fg_color.green, fg_color.blue, 0.5)
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.55)
         cr.set_line_width(1)
-        cr.move_to(margin_left, margin_top)
-        cr.line_to(margin_left, margin_top + plot_h)
-        cr.line_to(margin_left + plot_w, margin_top + plot_h)
+        cr.move_to(margin_l, margin_t)
+        cr.line_to(margin_l, margin_t + ph)
+        cr.line_to(margin_l + pw, margin_t + ph)
         cr.stroke()
 
-        # linha de referência y=1 (sem multiplicação)
-        y_max = max(self.params["max_multiplier"], self.MAX_MULT_DISPLAY_FLOOR)
-        ref_y = margin_top + plot_h - (1.0 / y_max) * plot_h
+        # linha de referência ×1.0
+        y_max = max(self.curve.get("max_multiplier", 3.0), self.MIN_Y_SCALE)
+        ref_y = margin_t + ph - (1.0 / y_max) * ph
         cr.set_dash([4, 4])
-        cr.set_source_rgba(fg_color.red, fg_color.green, fg_color.blue, 0.25)
-        cr.move_to(margin_left, ref_y)
-        cr.line_to(margin_left + plot_w, ref_y)
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.25)
+        cr.move_to(margin_l, ref_y)
+        cr.line_to(margin_l + pw, ref_y)
         cr.stroke()
         cr.set_dash([])
 
-        # marca da deadzone (linha vertical)
-        if self.params["deadzone"] > 0:
-            dz_x = margin_left + (self.params["deadzone"] / self.MAX_SPEED_PPS) * plot_w
-            if dz_x < margin_left + plot_w:
+        # dead-zone
+        dz = self.curve.get("deadzone", 0)
+        if dz > 0:
+            dz_x = margin_l + (dz / self.MAX_SPEED_PPS) * pw
+            if dz_x < margin_l + pw:
                 cr.set_source_rgba(1.0, 0.5, 0.2, 0.45)
                 cr.set_dash([3, 3])
-                cr.move_to(dz_x, margin_top)
-                cr.line_to(dz_x, margin_top + plot_h)
+                cr.move_to(dz_x, margin_t)
+                cr.line_to(dz_x, margin_t + ph)
                 cr.stroke()
                 cr.set_dash([])
 
         # curva
         cr.set_source_rgba(0.27, 0.6, 0.95, 1.0)
         cr.set_line_width(2.4)
-        samples = 160
-        for i in range(samples + 1):
-            speed = self.MAX_SPEED_PPS * (i / samples)
-            mult = self._multiplier_at(speed)
-            x = margin_left + plot_w * (i / samples)
-            y = margin_top + plot_h - (mult / y_max) * plot_h
-            y = max(margin_top, min(margin_top + plot_h, y))
+        for i in range(161):
+            speed = self.MAX_SPEED_PPS * (i / 160)
+            mult = mft_common.multiplier_for(speed, self.curve)
+            x = margin_l + pw * (i / 160)
+            y = margin_t + ph - (mult / y_max) * ph
+            y = max(margin_t, min(margin_t + ph, y))
             if i == 0:
                 cr.move_to(x, y)
             else:
                 cr.line_to(x, y)
         cr.stroke()
 
-        # texto: eixos
-        cr.set_source_rgba(fg_color.red, fg_color.green, fg_color.blue, 0.75)
+        # rótulos
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.75)
         cr.select_font_face("Sans", 0, 0)
         cr.set_font_size(10)
-
-        # ticks Y (1.0 e y_max)
         cr.move_to(6, ref_y + 4)
         cr.show_text("×1.0")
-        cr.move_to(6, margin_top + 10)
+        cr.move_to(6, margin_t + 10)
         cr.show_text(f"×{y_max:.1f}")
-
-        # rótulos X
-        cr.move_to(margin_left - 2, margin_top + plot_h + 16)
+        cr.move_to(margin_l - 2, margin_t + ph + 18)
         cr.show_text("0 px/s")
         label_max = f"{int(self.MAX_SPEED_PPS)} px/s"
-        text_w = cr.text_extents(label_max).width
-        cr.move_to(margin_left + plot_w - text_w, margin_top + plot_h + 16)
+        ext = cr.text_extents(label_max)
+        cr.move_to(margin_l + pw - ext.width, margin_t + ph + 18)
         cr.show_text(label_max)
 
 
-# ---------- janela principal ----------
+# ====================== live monitor ======================
 
 
-class MouseFineTuningWindow(Adw.ApplicationWindow):
-    __gtype_name__ = "MouseFineTuningWindow"
+class LiveMonitor(Gtk.DrawingArea):
+    __gtype_name__ = "LiveMonitor"
 
-    def __init__(self, app: Adw.Application) -> None:
-        super().__init__(
-            application=app,
-            title="Mouse Fine-Tuning",
-            default_width=620,
-            default_height=720,
-        )
-        self.set_size_request(480, 600)
-        self.settings = Gio.Settings.new(SCHEMA)
+    WINDOW_SECONDS = 5.0
+    BUFFER_SIZE = 600  # ~30 Hz × 5s × margem
+    TICK_INTERVAL_MS = 50  # 20 Hz heartbeat — timeline sempre rola
 
-        self.curve_config = load_curve_config()
-        self._save_timer_id: int | None = None
-        self._refreshing_devices = False
+    def __init__(self) -> None:
+        super().__init__()
+        self.set_size_request(380, 160)
+        self.set_hexpand(True)
+        self.set_draw_func(self._on_draw)
+        self.samples: collections.deque = collections.deque(maxlen=self.BUFFER_SIZE)
+        self.active = False
+        self.empty_message = "Mexa o mouse para ver o efeito da curva ao vivo."
+        self._tick_id: int | None = None
 
-        self._build_ui()
-        self._install_actions()
-        self._refresh_daemon_status()
-        self._refresh_devices_combo()
+    def add_sample(self, t: float, speed_in: float, speed_out: float) -> None:
+        self.samples.append((t, speed_in, speed_out))
+        self.queue_draw()
 
-        # polling lento de status do daemon
-        GLib.timeout_add_seconds(3, self._on_periodic_tick)
+    def reset(self) -> None:
+        self.samples.clear()
+        self.queue_draw()
 
-    # ----- construção da UI -----
+    def set_active(self, active: bool) -> None:
+        if self.active == active:
+            return
+        self.active = active
+        if active and self._tick_id is None:
+            self._tick_id = GLib.timeout_add(self.TICK_INTERVAL_MS, self._tick)
+        elif not active and self._tick_id is not None:
+            GLib.source_remove(self._tick_id)
+            self._tick_id = None
+            self.reset()
 
-    def _build_ui(self) -> None:
-        toolbar = Adw.ToolbarView()
+    def _tick(self) -> bool:
+        """Heartbeat: garante que a timeline rola mesmo sem movimento real."""
+        if not self.active:
+            return GLib.SOURCE_REMOVE
+        now = time.monotonic()
+        # se há pouco tempo desde a última sample (real ou sintética), pular
+        if not self.samples or (now - self.samples[-1][0]) > self.TICK_INTERVAL_MS / 1000.0:
+            self.add_sample(now, 0.0, 0.0)
+        else:
+            self.queue_draw()
+        return GLib.SOURCE_CONTINUE
 
-        header = Adw.HeaderBar()
+    def _on_draw(self, _area, cr, width, height) -> None:
+        margin_l, margin_r, margin_t, margin_b = 46, 14, 16, 22
+        pw = width - margin_l - margin_r
+        ph = height - margin_t - margin_b
+        if pw < 20 or ph < 20:
+            return
 
-        menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic")
-        menu_button.set_tooltip_text("Menu principal")
-        menu = Gio.Menu()
-        menu.append("Restaurar padrões", "win.reset")
-        menu.append("Resetar curva", "win.reset_curve")
-        menu.append("Sobre o Mouse Fine-Tuning", "win.about")
-        menu_button.set_menu_model(menu)
-        header.pack_end(menu_button)
+        fg = self.get_style_context().get_color()
 
-        self.view_stack = Adw.ViewStack()
-        self.view_stack.add_titled_with_icon(
-            self._build_basic_page(), "basic", "Configurações", "input-mouse-symbolic"
-        )
-        self.view_stack.add_titled_with_icon(
-            self._build_curve_page(),
-            "curve",
-            "Curva",
-            "preferences-other-symbolic",
-        )
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.55)
+        cr.set_line_width(1)
+        cr.move_to(margin_l, margin_t)
+        cr.line_to(margin_l, margin_t + ph)
+        cr.line_to(margin_l + pw, margin_t + ph)
+        cr.stroke()
 
-        switcher = Adw.ViewSwitcher()
-        switcher.set_stack(self.view_stack)
-        switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
-        header.set_title_widget(switcher)
+        if not self.samples or not self.active:
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.55)
+            cr.select_font_face("Sans", 0, 0)
+            cr.set_font_size(11)
+            msg = self.empty_message if self.active else "Live monitor desligado."
+            ext = cr.text_extents(msg)
+            cr.move_to(margin_l + (pw - ext.width) / 2, margin_t + ph / 2)
+            cr.show_text(msg)
+            return
 
-        toolbar.add_top_bar(header)
-        toolbar.set_content(self.view_stack)
-        self.set_content(toolbar)
+        now = self.samples[-1][0]
+        oldest_t = now - self.WINDOW_SECONDS
 
-    # ----- página "Configurações" (gsettings) -----
+        max_speed = 100.0
+        for t, sin, sout in self.samples:
+            if t < oldest_t:
+                continue
+            max_speed = max(max_speed, sin, sout)
+        max_speed *= 1.15
 
-    def _build_basic_page(self) -> Adw.PreferencesPage:
-        page = Adw.PreferencesPage()
-        page.add(self._build_speed_group())
-        page.add(self._build_accel_group())
-        page.add(self._build_fine_group())
-        return page
+        # ticks Y
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.55)
+        cr.select_font_face("Sans", 0, 0)
+        cr.set_font_size(9)
+        cr.move_to(6, margin_t + 10)
+        cr.show_text(f"{int(max_speed)} px/s")
+
+        def plot(idx, color):
+            cr.set_source_rgba(*color)
+            cr.set_line_width(1.6)
+            first = True
+            for t, sin, sout in self.samples:
+                v = sin if idx == 0 else sout
+                if t < oldest_t:
+                    continue
+                x_frac = (t - oldest_t) / self.WINDOW_SECONDS
+                x = margin_l + pw * x_frac
+                y = margin_t + ph - (v / max_speed) * ph
+                y = max(margin_t, min(margin_t + ph, y))
+                if first:
+                    cr.move_to(x, y)
+                    first = False
+                else:
+                    cr.line_to(x, y)
+            cr.stroke()
+
+        plot(0, (0.55, 0.55, 0.55, 0.85))    # cinza — entrada
+        plot(1, (0.27, 0.60, 0.95, 1.0))     # azul — saída
+
+        # legenda no canto superior direito
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.80)
+        cr.set_font_size(10)
+        lx = margin_l + pw - 130
+        cr.set_source_rgba(0.55, 0.55, 0.55, 0.85)
+        cr.move_to(lx, margin_t + 12)
+        cr.show_text("— Entrada (mouse)")
+        cr.set_source_rgba(0.27, 0.60, 0.95, 1.0)
+        cr.move_to(lx, margin_t + 26)
+        cr.show_text("— Saída (com curva)")
+
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.55)
+        cr.set_font_size(9)
+        cr.move_to(margin_l, margin_t + ph + 14)
+        cr.show_text(f"-{self.WINDOW_SECONDS:.0f}s")
+        ext = cr.text_extents("agora")
+        cr.move_to(margin_l + pw - ext.width, margin_t + ph + 14)
+        cr.show_text("agora")
+
+
+# ====================== IPC client (thread) ======================
+
+
+class DaemonIPC:
+    """Cliente do socket Unix do daemon. Thread leitora, callbacks no main loop."""
+
+    def __init__(self) -> None:
+        self.sock: socket.socket | None = None
+        self.thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        # callbacks no main loop
+        self.on_event = lambda msg: None
+        self.on_device_list = lambda msg: None
+        self.on_connect_changed = lambda connected: None
+
+    @property
+    def connected(self) -> bool:
+        return self.sock is not None
+
+    def connect(self) -> bool:
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(str(mft_common.SOCKET_PATH))
+            s.setblocking(True)
+        except (OSError, FileNotFoundError):
+            return False
+        self.sock = s
+        self._stop.clear()
+        self.thread = threading.Thread(target=self._read_loop, daemon=True)
+        self.thread.start()
+        GLib.idle_add(self.on_connect_changed, True)
+        return True
+
+    def disconnect(self) -> None:
+        self._stop.set()
+        if self.sock:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def _send(self, msg: dict) -> bool:
+        if not self.sock:
+            return False
+        try:
+            self.sock.send((json.dumps(msg) + "\n").encode())
+            return True
+        except (OSError, BrokenPipeError):
+            self.disconnect()
+            GLib.idle_add(self.on_connect_changed, False)
+            return False
+
+    def subscribe(self, device_id: str) -> bool:
+        return self._send({"cmd": "subscribe", "device_id": device_id or "*"})
+
+    def unsubscribe(self) -> bool:
+        return self._send({"cmd": "unsubscribe"})
+
+    def request_device_list(self) -> bool:
+        return self._send({"cmd": "list_devices"})
+
+    def _read_loop(self) -> None:
+        buf = b""
+        sock = self.sock
+        while not self._stop.is_set() and sock is not None:
+            try:
+                data = sock.recv(4096)
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                mtype = msg.get("type")
+                if mtype == "event":
+                    GLib.idle_add(self.on_event, msg)
+                elif mtype == "device_list":
+                    GLib.idle_add(self.on_device_list, msg)
+        self.sock = None
+        GLib.idle_add(self.on_connect_changed, False)
+
+
+# ====================== páginas ======================
+
+
+class BasicPage:
+    """Aba 'Configurações' — gsettings do GNOME."""
+
+    def __init__(self, settings: Gio.Settings) -> None:
+        self.settings = settings
+        self.page = Adw.PreferencesPage()
+        self.page.add(self._build_speed_group())
+        self.page.add(self._build_accel_group())
+        self.page.add(self._build_fine_group())
 
     def _build_speed_group(self) -> Adw.PreferencesGroup:
         group = Adw.PreferencesGroup(
             title="Velocidade",
             description=(
-                "Ajuste a velocidade do ponteiro. Aplica-se a todos os "
-                "mouses conectados."
+                "Ajuste a velocidade do ponteiro. Aplica-se a todos os mouses conectados."
             ),
         )
 
-        self.speed_adj = Gtk.Adjustment(
-            lower=-1.0,
-            upper=1.0,
-            step_increment=0.01,
-            page_increment=0.1,
+        adj = Gtk.Adjustment(
+            lower=-1.0, upper=1.0, step_increment=0.01, page_increment=0.1
         )
-        self.settings.bind(
-            "speed", self.speed_adj, "value", Gio.SettingsBindFlags.DEFAULT
-        )
+        self.settings.bind("speed", adj, "value", Gio.SettingsBindFlags.DEFAULT)
 
         slider_row = Adw.ActionRow(
             title="Velocidade do ponteiro",
@@ -352,7 +440,7 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
         )
         scale = Gtk.Scale(
             orientation=Gtk.Orientation.HORIZONTAL,
-            adjustment=self.speed_adj,
+            adjustment=adj,
             hexpand=True,
             draw_value=False,
             valign=Gtk.Align.CENTER,
@@ -364,13 +452,11 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
         slider_row.add_suffix(scale)
         group.add(slider_row)
 
-        spin_row = Adw.SpinRow(
-            title="Ajuste fino",
-            subtitle="Mesma escala com precisão de 0.01",
-            digits=2,
+        spin = Adw.SpinRow(
+            title="Ajuste fino", subtitle="Mesma escala com precisão de 0.01", digits=2
         )
-        spin_row.set_adjustment(self.speed_adj)
-        group.add(spin_row)
+        spin.set_adjustment(adj)
+        group.add(spin)
 
         return group
 
@@ -378,22 +464,18 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
         group = Adw.PreferencesGroup(
             title="Aceleração nativa",
             description=(
-                "Perfil aplicado pelo libinput. Quando a curva customizada "
-                "(aba “Curva”) estiver ativa, recomenda-se manter este perfil "
-                "em “Desativada (flat)”."
+                "Perfil aplicado pelo libinput. Quando uma curva customizada "
+                "(aba “Dispositivos”) estiver ativa, este perfil é forçado para "
+                "“Desativada (flat)” automaticamente."
             ),
         )
-
         self.combo = Adw.ComboRow(title="Perfil de aceleração")
         self.combo.set_model(Gtk.StringList.new(PROFILE_LABELS))
         group.add(self.combo)
 
-        self.settings.connect(
-            "changed::accel-profile", self._on_profile_setting_changed
-        )
+        self.settings.connect("changed::accel-profile", self._on_profile_setting_changed)
         self.combo.connect("notify::selected", self._on_profile_combo_changed)
         self._on_profile_setting_changed(self.settings, "accel-profile")
-
         return group
 
     def _build_fine_group(self) -> Adw.PreferencesGroup:
@@ -404,74 +486,84 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
                 "movimentos curtos."
             ),
         )
-
-        self.drag_adj = Gtk.Adjustment(
+        adj = Gtk.Adjustment(
             lower=1, upper=30, step_increment=1, page_increment=5
         )
         self.settings.bind(
-            "drag-threshold", self.drag_adj, "value", Gio.SettingsBindFlags.DEFAULT
+            "drag-threshold", adj, "value", Gio.SettingsBindFlags.DEFAULT
         )
-        drag_row = Adw.SpinRow(
+        row = Adw.SpinRow(
             title="Limiar de arrasto",
             subtitle="Pixels antes do sistema reconhecer um arrasto",
             digits=0,
         )
-        drag_row.set_adjustment(self.drag_adj)
-        group.add(drag_row)
-
+        row.set_adjustment(adj)
+        group.add(row)
         return group
 
-    # ----- página "Curva" -----
+    def _on_profile_setting_changed(self, settings, _key) -> None:
+        current = settings.get_string("accel-profile")
+        try:
+            idx = PROFILES.index(current)
+        except ValueError:
+            idx = 0
+        if self.combo.get_selected() != idx:
+            self.combo.set_selected(idx)
 
-    def _build_curve_page(self) -> Adw.PreferencesPage:
-        page = Adw.PreferencesPage()
-        page.add(self._build_curve_status_group())
-        page.add(self._build_curve_params_group())
-        page.add(self._build_curve_preview_group())
-        return page
+    def _on_profile_combo_changed(self, combo, _pspec) -> None:
+        idx = combo.get_selected()
+        if idx >= len(PROFILES):
+            return
+        new = PROFILES[idx]
+        if self.settings.get_string("accel-profile") != new:
+            self.settings.set_string("accel-profile", new)
 
-    def _build_curve_status_group(self) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(
-            title="Curva customizada",
+
+class PresetsPage:
+    """Aba 'Presets' — editor + preview + live monitor."""
+
+    def __init__(self, window: MouseFineTuningWindow) -> None:
+        self.window = window
+        self.page = Adw.PreferencesPage()
+        # (debounce de save removido — agora há botão Salvar explícito)
+        self._suppressing = False
+
+        # ----- grupo: seleção -----
+        sel_group = Adw.PreferencesGroup(
+            title="Biblioteca de presets",
             description=(
-                "Quando habilitada, um daemon em background substitui a "
-                "aceleração do sistema pela curva configurada abaixo."
+                "Built-ins são imutáveis (Linear, Suave, FPS, Quake, Desenho). "
+                "Duplique para editar com seu próprio nome."
             ),
         )
+        self.preset_combo = Adw.ComboRow(title="Preset")
+        sel_group.add(self.preset_combo)
 
-        self.enable_row = Adw.SwitchRow(
-            title="Habilitar curva customizada",
-            subtitle="Inicia/para o serviço mouse-curve-daemon",
-        )
-        self.enable_row.connect("notify::active", self._on_enable_toggled)
-        group.add(self.enable_row)
+        self.description_row = Adw.ActionRow(title="Descrição", subtitle="")
+        sel_group.add(self.description_row)
 
-        self.device_row = Adw.ComboRow(
-            title="Mouse",
-            subtitle="Dispositivo de entrada interceptado",
-        )
-        self.device_row.connect("notify::selected", self._on_device_selected)
-        group.add(self.device_row)
+        action_row = Adw.ActionRow(title="Ações")
+        self.new_btn = Gtk.Button(label="Novo", valign=Gtk.Align.CENTER)
+        self.new_btn.connect("clicked", self._on_new)
+        self.duplicate_btn = Gtk.Button(label="Duplicar", valign=Gtk.Align.CENTER)
+        self.duplicate_btn.connect("clicked", self._on_duplicate)
+        self.rename_btn = Gtk.Button(label="Renomear", valign=Gtk.Align.CENTER)
+        self.rename_btn.connect("clicked", self._on_rename)
+        self.delete_btn = Gtk.Button(label="Deletar", valign=Gtk.Align.CENTER)
+        self.delete_btn.add_css_class("destructive-action")
+        self.delete_btn.connect("clicked", self._on_delete)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.append(self.new_btn)
+        box.append(self.duplicate_btn)
+        box.append(self.rename_btn)
+        box.append(self.delete_btn)
+        action_row.add_suffix(box)
+        sel_group.add(action_row)
+        self.page.add(sel_group)
 
-        self.status_row = Adw.ActionRow(
-            title="Status do daemon",
-            subtitle="—",
-        )
-        refresh_btn = Gtk.Button(
-            icon_name="view-refresh-symbolic",
-            valign=Gtk.Align.CENTER,
-            tooltip_text="Atualizar status e lista de mouses",
-        )
-        refresh_btn.add_css_class("flat")
-        refresh_btn.connect("clicked", lambda *_: self._refresh_all())
-        self.status_row.add_suffix(refresh_btn)
-        group.add(self.status_row)
-
-        return group
-
-    def _build_curve_params_group(self) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(
-            title="Parâmetros da curva",
+        # ----- grupo: parâmetros -----
+        params_group = Adw.PreferencesGroup(
+            title="Parâmetros",
             description=(
                 "f(v) = sensibilidade × (1 + ganho × ((v − dead-zone) / 1000) ^ "
                 "expoente), limitado pelo multiplicador máximo."
@@ -494,291 +586,695 @@ class MouseFineTuningWindow(Adw.ApplicationWindow):
             lower=1.0, upper=10.0, step_increment=0.1, page_increment=1.0
         )
 
-        c = self.curve_config["curve"]
-        self.sensitivity_adj.set_value(c["sensitivity"])
-        self.gain_adj.set_value(c["gain"])
-        self.power_adj.set_value(c["power"])
-        self.deadzone_adj.set_value(c["deadzone"])
-        self.max_mult_adj.set_value(c["max_multiplier"])
-
         rows_data = [
-            (
-                "Sensibilidade base",
-                "Multiplicador quando velocidade ≈ 0",
-                self.sensitivity_adj,
-                2,
-            ),
-            (
-                "Ganho de aceleração",
-                "Quanto a aceleração cresce com a velocidade",
-                self.gain_adj,
-                2,
-            ),
-            (
-                "Expoente",
-                "1.0 = linear; >1 acelera mais em alta velocidade",
-                self.power_adj,
-                2,
-            ),
-            (
-                "Dead-zone (px/s)",
-                "Velocidade abaixo desta não recebe aceleração extra",
-                self.deadzone_adj,
-                0,
-            ),
-            (
-                "Multiplicador máximo",
-                "Teto absoluto do multiplicador resultante",
-                self.max_mult_adj,
-                1,
-            ),
+            ("Sensibilidade base", "Multiplicador quando velocidade ≈ 0", self.sensitivity_adj, 2),
+            ("Ganho de aceleração", "Quanto a aceleração cresce com a velocidade", self.gain_adj, 2),
+            ("Expoente", "1.0 = linear; >1 acelera mais em alta velocidade", self.power_adj, 2),
+            ("Dead-zone (px/s)", "Velocidades abaixo desta não recebem aceleração extra", self.deadzone_adj, 0),
+            ("Multiplicador máximo", "Teto absoluto", self.max_mult_adj, 1),
         ]
+        self.param_rows: list[Adw.SpinRow] = []
         for title, subtitle, adj, digits in rows_data:
-            row = Adw.SpinRow(title=title, subtitle=subtitle, digits=digits)
-            row.set_adjustment(adj)
-            adj.connect("value-changed", self._on_curve_param_changed)
-            group.add(row)
+            r = Adw.SpinRow(title=title, subtitle=subtitle, digits=digits)
+            r.set_adjustment(adj)
+            adj.connect("value-changed", self._on_param_changed)
+            params_group.add(r)
+            self.param_rows.append(r)
 
-        return group
+        # Botões Salvar/Descartar — só ficam habilitados quando há mudanças
+        # pendentes em um preset custom (built-ins são read-only).
+        self.save_status_row = Adw.ActionRow(
+            title="Estado",
+            subtitle="Sem mudanças pendentes",
+        )
+        self.discard_btn = Gtk.Button(
+            label="Descartar", valign=Gtk.Align.CENTER, sensitive=False
+        )
+        self.discard_btn.connect("clicked", self._on_discard)
+        self.save_btn = Gtk.Button(
+            label="Salvar", valign=Gtk.Align.CENTER, sensitive=False
+        )
+        self.save_btn.add_css_class("suggested-action")
+        self.save_btn.connect("clicked", self._on_save)
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_box.append(self.discard_btn)
+        btn_box.append(self.save_btn)
+        self.save_status_row.add_suffix(btn_box)
+        params_group.add(self.save_status_row)
 
-    def _build_curve_preview_group(self) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(
-            title="Visualização da curva",
+        self.page.add(params_group)
+
+        self.dirty = False  # True se há mudanças não salvas
+
+        # ----- grupo: preview -----
+        preview_group = Adw.PreferencesGroup(
+            title="Preview da curva",
             description=(
-                "Eixo X: velocidade do mouse (pixels por segundo). "
-                "Eixo Y: multiplicador aplicado. A linha tracejada é "
-                "“sem aceleração” (×1.0)."
+                "Eixo X: velocidade do mouse (px/s). Eixo Y: multiplicador aplicado. "
+                "Tracejado horizontal é ×1.0; vertical laranja é a dead-zone."
             ),
         )
-
         self.preview = CurvePreview()
-        self.preview.set_margin_top(8)
-        self.preview.set_margin_bottom(8)
-        self.preview.set_margin_start(8)
-        self.preview.set_margin_end(8)
+        self.preview.set_margin_top(6)
+        self.preview.set_margin_bottom(6)
+        frame = Gtk.Frame(child=self.preview)
+        host = Adw.PreferencesRow()
+        host.set_activatable(False)
+        host.set_selectable(False)
+        host.set_child(frame)
+        preview_group.add(host)
+        self.page.add(preview_group)
 
-        wrapper = Gtk.Frame()
-        wrapper.set_child(self.preview)
-        wrapper.set_margin_top(4)
-        wrapper.set_margin_bottom(4)
-
-        host_row = Adw.PreferencesRow()
-        host_row.set_activatable(False)
-        host_row.set_selectable(False)
-        host_row.set_child(wrapper)
-        group.add(host_row)
-
-        self._sync_preview_from_adjustments()
-        return group
-
-    # ----- handlers da página "Curva" -----
-
-    def _sync_preview_from_adjustments(self) -> None:
-        self.preview.set_params(
-            sensitivity=self.sensitivity_adj.get_value(),
-            gain=self.gain_adj.get_value(),
-            power=self.power_adj.get_value(),
-            deadzone=self.deadzone_adj.get_value(),
-            max_multiplier=self.max_mult_adj.get_value(),
+        # ----- grupo: velocidade do mouse (independente do preset) -----
+        speed_group = Adw.PreferencesGroup(
+            title="Velocidade do mouse",
+            description=(
+                "Velocidade global do ponteiro. Funciona em qualquer preset — "
+                "mesmo em “Adaptativa”. Equivalente ao slider do GNOME."
+            ),
+        )
+        speed_adj = Gtk.Adjustment(
+            lower=-1.0, upper=1.0, step_increment=0.05, page_increment=0.2
+        )
+        self.window.settings.bind(
+            "speed", speed_adj, "value", Gio.SettingsBindFlags.DEFAULT
         )
 
-    def _on_curve_param_changed(self, _adj) -> None:
-        self._sync_preview_from_adjustments()
-        # debounce: salva 400ms após última mudança
-        if self._save_timer_id is not None:
-            GLib.source_remove(self._save_timer_id)
-        self._save_timer_id = GLib.timeout_add(400, self._commit_curve)
+        slider_row = Adw.ActionRow(
+            title="Velocidade do ponteiro",
+            subtitle="Arraste o controle ou use o spin abaixo para ajuste fino",
+        )
+        scale = Gtk.Scale(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            adjustment=speed_adj,
+            hexpand=True,
+            draw_value=False,
+            valign=Gtk.Align.CENTER,
+        )
+        scale.set_size_request(260, -1)
+        scale.add_mark(-1.0, Gtk.PositionType.BOTTOM, "Lento")
+        scale.add_mark(0.0, Gtk.PositionType.BOTTOM, "Padrão")
+        scale.add_mark(1.0, Gtk.PositionType.BOTTOM, "Rápido")
+        slider_row.add_suffix(scale)
+        speed_group.add(slider_row)
 
-    def _commit_curve(self) -> bool:
-        self.curve_config["curve"] = {
+        spin_speed = Adw.SpinRow(
+            title="Ajuste fino", subtitle="Precisão de 0.05", digits=2
+        )
+        spin_speed.set_adjustment(speed_adj)
+        speed_group.add(spin_speed)
+        self.page.add(speed_group)
+
+        # ----- grupo: live monitor -----
+        live_group = Adw.PreferencesGroup(
+            title="Live monitor (osciloscópio)",
+            description=(
+                "Mostra em tempo real a velocidade do seu mouse passando pela curva. "
+                "Cinza: entrada (movimento físico). Azul: saída (após curva)."
+            ),
+        )
+        self.live_toggle = Adw.SwitchRow(
+            title="Mostrar movimento real",
+            subtitle="Conecta ao daemon e exibe os eventos em vivo",
+        )
+        self.live_toggle.connect("notify::active", self._on_live_toggle)
+        live_group.add(self.live_toggle)
+
+        self.live_monitor = LiveMonitor()
+        live_host = Adw.PreferencesRow()
+        live_host.set_activatable(False)
+        live_host.set_selectable(False)
+        lframe = Gtk.Frame(child=self.live_monitor)
+        live_host.set_child(lframe)
+        live_group.add(live_host)
+        self.page.add(live_group)
+
+        self._live_devices: list[dict] = []
+        self._in_use_ids: set[str] = set()
+        self.rebuild_preset_list()
+
+    # ----- preset list -----
+
+    def rebuild_preset_list(self, select_name: str | None = None) -> None:
+        names = [p["name"] for p in self.window.presets]
+        self._suppressing = True
+        try:
+            self.preset_combo.set_model(Gtk.StringList.new(names))
+            target = select_name or (self.window.active_preset_name or (names[0] if names else None))
+            if target and target in names:
+                self.preset_combo.set_selected(names.index(target))
+            elif names:
+                self.preset_combo.set_selected(0)
+        finally:
+            self._suppressing = False
+        self.preset_combo.connect("notify::selected", self._on_preset_selected)
+        self._on_preset_selected(self.preset_combo, None)
+
+    def _current_preset(self) -> dict | None:
+        idx = self.preset_combo.get_selected()
+        if 0 <= idx < len(self.window.presets):
+            return self.window.presets[idx]
+        return None
+
+    def _on_preset_selected(self, _combo, _pspec) -> None:
+        preset = self._current_preset()
+        if not preset:
+            return
+        previous = self.window.active_preset_name
+        self.window.active_preset_name = preset["name"]
+        is_builtin = preset["builtin"]
+
+        self._suppressing = True
+        try:
+            c = preset["curve"]
+            self.sensitivity_adj.set_value(c["sensitivity"])
+            self.gain_adj.set_value(c["gain"])
+            self.power_adj.set_value(c["power"])
+            self.deadzone_adj.set_value(c["deadzone"])
+            self.max_mult_adj.set_value(c["max_multiplier"])
+            self.description_row.set_subtitle(preset.get("description", ""))
+            for r in self.param_rows:
+                r.set_sensitive(not is_builtin)
+            self.rename_btn.set_sensitive(not is_builtin)
+            self.delete_btn.set_sensitive(not is_builtin)
+            tag = " (Built-in)" if is_builtin else ""
+            self.description_row.set_title(f"Descrição{tag}")
+        finally:
+            self._suppressing = False
+
+        self.preview.set_curve(preset["curve"])
+        # Reseta estado de "mudanças não salvas" ao trocar de preset
+        if hasattr(self, "save_btn"):
+            self._set_dirty(False)
+
+        # Auto-aplica em qualquer mudança de preset (curva ou Adaptativa).
+        if previous != preset["name"]:
+            self.schedule_auto_apply()
+
+    # ----- editing -----
+
+    def _current_curve_from_sliders(self) -> dict:
+        return {
             "sensitivity": self.sensitivity_adj.get_value(),
             "gain": self.gain_adj.get_value(),
             "power": self.power_adj.get_value(),
             "deadzone": self.deadzone_adj.get_value(),
             "max_multiplier": self.max_mult_adj.get_value(),
         }
-        try:
-            save_curve_config(self.curve_config)
-            daemon_reload_config()
-        except OSError as e:
-            self._set_status(f"Erro salvando: {e}", warning=True)
-        self._save_timer_id = None
-        return GLib.SOURCE_REMOVE
 
-    def _on_enable_toggled(self, switch: Adw.SwitchRow, _pspec) -> None:
-        if self._refreshing_devices:
+    def _on_param_changed(self, _adj) -> None:
+        """Apenas atualiza o preview e marca dirty. NÃO salva no disco nem
+        notifica o daemon — isso só acontece quando o usuário clica em
+        'Salvar' (evita o mouse 'parar' durante a edição)."""
+        if self._suppressing:
             return
-        if switch.get_active():
-            if not daemon_unit_exists():
-                self._set_status(
-                    "Unit systemd ausente. Rode setup.sh primeiro.", warning=True
-                )
-                switch.set_active(False)
+        preset = self._current_preset()
+        if not preset or preset["builtin"]:
+            return
+        curve = self._current_curve_from_sliders()
+        self.preview.set_curve(curve)
+        self._set_dirty(True)
+
+    def _set_dirty(self, dirty: bool) -> None:
+        self.dirty = dirty
+        is_builtin = bool(self._current_preset() and self._current_preset()["builtin"])
+        self.save_btn.set_sensitive(dirty and not is_builtin)
+        self.discard_btn.set_sensitive(dirty and not is_builtin)
+        if is_builtin:
+            self.save_status_row.set_subtitle("Built-in — somente leitura. Duplique para editar.")
+        elif dirty:
+            self.save_status_row.set_subtitle("Mudanças não salvas — clique Salvar para aplicar")
+            self.save_status_row.add_css_class("warning")
+        else:
+            self.save_status_row.set_subtitle("Sem mudanças pendentes")
+            self.save_status_row.remove_css_class("warning")
+
+    def _on_save(self, _btn) -> None:
+        preset = self._current_preset()
+        if not preset or preset["builtin"]:
+            return
+        curve = self._current_curve_from_sliders()
+        mft_common.save_custom_preset(
+            preset["name"], preset.get("description", ""), curve
+        )
+        self.window.reload_presets(keep_selection=preset["name"])
+        daemon_reload()
+        self._set_dirty(False)
+        self.window.toast(f"Curva “{preset['name']}” salva")
+
+    def _on_discard(self, _btn) -> None:
+        preset = self._current_preset()
+        if not preset:
+            return
+        # Recarrega sliders com os valores do disco (preset original)
+        self._suppressing = True
+        try:
+            c = preset["curve"]
+            self.sensitivity_adj.set_value(c["sensitivity"])
+            self.gain_adj.set_value(c["gain"])
+            self.power_adj.set_value(c["power"])
+            self.deadzone_adj.set_value(c["deadzone"])
+            self.max_mult_adj.set_value(c["max_multiplier"])
+        finally:
+            self._suppressing = False
+        self.preview.set_curve(preset["curve"])
+        self._set_dirty(False)
+
+    # ----- new / duplicate / rename / delete -----
+
+    def _on_new(self, _btn) -> None:
+        """Abre dialog pra nomear um novo preset custom com curva default."""
+        dlg = Adw.AlertDialog(
+            heading="Novo preset",
+            body="Crie um preset customizado vazio. Os parâmetros começam com valores padrão e podem ser editados depois.",
+        )
+        entry = Gtk.Entry(placeholder_text="Nome do novo preset")
+        dlg.set_extra_child(entry)
+        dlg.add_response("cancel", "Cancelar")
+        dlg.add_response("create", "Criar")
+        dlg.set_response_appearance("create", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("create")
+        dlg.set_close_response("cancel")
+
+        def on_response(_dlg, response):
+            if response != "create":
                 return
-            self.settings.set_string("accel-profile", "flat")
-            self._commit_curve_now()
-            ok, msg = daemon_start()
-            if not ok:
-                self._set_status(f"Falha ao iniciar: {msg}", warning=True)
-                switch.set_active(False)
-        else:
-            ok, msg = daemon_stop()
-            if not ok and "not loaded" not in msg.lower():
-                self._set_status(f"Falha ao parar: {msg}", warning=True)
-        GLib.timeout_add(300, self._refresh_daemon_status_and_return_false)
+            name = entry.get_text().strip()
+            if not name:
+                self.window.toast("Nome não pode estar vazio")
+                return
+            existing = {p["name"] for p in self.window.presets}
+            if name in existing:
+                self.window.toast(f"Já existe um preset chamado “{name}”")
+                return
+            mft_common.save_custom_preset(name, "", dict(mft_common.DEFAULT_CURVE))
+            self.window.reload_presets(keep_selection=name)
+            daemon_reload()
 
-    def _commit_curve_now(self) -> None:
-        if self._save_timer_id is not None:
-            GLib.source_remove(self._save_timer_id)
-            self._save_timer_id = None
-        self._commit_curve()
+        dlg.connect("response", on_response)
+        dlg.present(self.window)
 
-    def _on_device_selected(self, combo: Adw.ComboRow, _pspec) -> None:
-        if self._refreshing_devices:
+    def _on_duplicate(self, _btn) -> None:
+        preset = self._current_preset()
+        if not preset:
             return
-        idx = combo.get_selected()
-        if idx >= len(self._device_paths):
+        base = preset["name"]
+        new_name = base + " cópia"
+        n = 2
+        existing = {p["name"] for p in self.window.presets}
+        while new_name in existing:
+            new_name = f"{base} cópia {n}"
+            n += 1
+        mft_common.save_custom_preset(new_name, preset.get("description", ""), preset["curve"])
+        self.window.reload_presets(keep_selection=new_name)
+        daemon_reload()
+
+    def _on_rename(self, _btn) -> None:
+        preset = self._current_preset()
+        if not preset or preset["builtin"]:
             return
-        path = self._device_paths[idx]
-        if self.curve_config.get("device_path") != path:
-            self.curve_config["device_path"] = path
-            self._commit_curve_now()
-            # reiniciar daemon se estava rodando para pegar novo device
-            if daemon_active():
-                systemctl("restart", DAEMON_UNIT)
+        dlg = Adw.AlertDialog(
+            heading="Renomear preset",
+            body=f"Novo nome para “{preset['name']}”:",
+        )
+        entry = Gtk.Entry(text=preset["name"])
+        dlg.set_extra_child(entry)
+        dlg.add_response("cancel", "Cancelar")
+        dlg.add_response("ok", "Renomear")
+        dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("ok")
+        dlg.set_close_response("cancel")
 
-    def _refresh_devices_combo(self) -> None:
-        self._refreshing_devices = True
-        try:
-            mice = list_mice()
-            self._device_paths = [p for p, _ in mice]
-            labels = [name for _, name in mice]
-            if not labels:
-                labels = (
-                    ["(python-evdev não instalado)"]
-                    if not HAVE_EVDEV
-                    else ["(nenhum mouse detectado)"]
-                )
-                self._device_paths = [""]
-            self.device_row.set_model(Gtk.StringList.new(labels))
-            saved = self.curve_config.get("device_path", "")
-            if saved in self._device_paths:
-                self.device_row.set_selected(self._device_paths.index(saved))
-            else:
-                self.device_row.set_selected(0)
-            self.device_row.set_sensitive(bool(self._device_paths and self._device_paths[0]))
-        finally:
-            self._refreshing_devices = False
+        def on_response(_dlg, response):
+            if response != "ok":
+                return
+            new_name = entry.get_text().strip()
+            if not new_name or new_name == preset["name"]:
+                return
+            result = mft_common.rename_custom_preset(preset["name"], new_name)
+            if result is None:
+                self.window.toast(f"Não foi possível renomear (conflito de nome?)")
+                return
+            self.window.reload_presets(keep_selection=result["name"])
+            daemon_reload()
 
-    def _set_status(self, text: str, warning: bool = False) -> None:
-        self.status_row.set_subtitle(text)
-        if warning:
-            self.status_row.add_css_class("warning")
-        else:
-            self.status_row.remove_css_class("warning")
+        dlg.connect("response", on_response)
+        dlg.present(self.window)
 
-    def _refresh_daemon_status(self) -> None:
+    def _on_delete(self, _btn) -> None:
+        preset = self._current_preset()
+        if not preset or preset["builtin"]:
+            return
+        dlg = Adw.AlertDialog(
+            heading=f"Deletar preset “{preset['name']}”?",
+            body="Esta ação não pode ser desfeita.",
+        )
+        dlg.add_response("cancel", "Cancelar")
+        dlg.add_response("delete", "Deletar")
+        dlg.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+
+        def on_response(_dlg, response):
+            if response != "delete":
+                return
+            if mft_common.delete_custom_preset(preset["name"]):
+                self.window.reload_presets()
+                daemon_reload()
+
+        dlg.connect("response", on_response)
+        dlg.present(self.window)
+
+    # ----- aplicação / detecção (sempre on, oculto ao usuário) -----
+
+    def update_devices(self, devices: list[dict]) -> None:
+        """Recebe lista do daemon via IPC."""
+        self._live_devices = [d for d in devices if d.get("present")]
+        self._in_use_ids = set(self.window.daemon_active_devices)
+
+    def refresh_apply_status(self) -> None:
+        """Compat: chamado de refresh_all e periodic_tick."""
+        self._in_use_ids = set(self.window.daemon_active_devices)
+
+    def schedule_auto_apply(self) -> None:
+        """Agenda uma aplicação automática (debounce 300ms)."""
+        if getattr(self, "_auto_apply_timer", None) is not None:
+            GLib.source_remove(self._auto_apply_timer)
+        self._auto_apply_timer = GLib.timeout_add(300, self._do_auto_apply)
+
+    def _do_auto_apply(self) -> bool:
+        """Auto-apply silencioso, dispara em mudança de preset:
+          - Adaptativa: aplica imediatamente (libera grabs, sem probe).
+          - Curva: se já houver mouse interceptado, troca a curva.
+                   Senão, faz probe assíncrono (até 3s) pra detectar mouse
+                   em uso e aplica nele. Fallback: aplica em todos os mouses
+                   presentes."""
+        self._auto_apply_timer = None
+        preset = self._current_preset()
+        if not preset:
+            return GLib.SOURCE_REMOVE
         if not daemon_unit_exists():
-            self._set_status(
-                "Unit systemd não instalada (rode `./setup.sh`)", warning=True
-            )
-            self.enable_row.set_sensitive(False)
-            return
-        self.enable_row.set_sensitive(True)
+            return GLib.SOURCE_REMOVE
 
-        active = daemon_active()
-        enabled = daemon_enabled()
+        if mft_common.is_system_default(preset):
+            self.window.apply_preset_to_in_use(preset["name"], set())
+            if self.window.ipc.connected:
+                self.window.ipc.request_device_list()
+            return GLib.SOURCE_REMOVE
 
-        if active and enabled:
-            self._set_status("Ativo e habilitado no login")
-        elif active:
-            self._set_status("Ativo (não inicia no login)")
-        elif enabled:
-            self._set_status("Habilitado no login mas inativo")
-        else:
-            self._set_status("Parado")
+        # Curva customizada
+        if not daemon_active():
+            daemon_start()
 
-        # refletir no switch sem disparar handler
-        self._refreshing_devices = True
-        try:
-            self.enable_row.set_active(active)
-        finally:
-            self._refreshing_devices = False
+        already_active = set(self.window.daemon_active_devices)
+        if already_active:
+            # Troca curva nos mouses já interceptados — instantâneo
+            self.window.apply_preset_to_in_use(preset["name"], already_active)
+            if self.window.ipc.connected:
+                self.window.ipc.request_device_list()
+            return GLib.SOURCE_REMOVE
 
-    def _refresh_daemon_status_and_return_false(self) -> bool:
-        self._refresh_daemon_status()
+        # Nenhum mouse interceptado ainda — detectar via probe
+        def worker():
+            in_use = self.window.detect_in_use_now(timeout=3.0)
+            if not in_use:
+                # Fallback: aplica em todos os mouses presentes
+                in_use = {m["id"] for m in mft_common.enumerate_present_mice()}
+            GLib.idle_add(self._finish_auto_apply, preset["name"], in_use)
+
+        threading.Thread(target=worker, daemon=True).start()
         return GLib.SOURCE_REMOVE
 
-    def _refresh_all(self) -> None:
-        self._refresh_devices_combo()
-        self._refresh_daemon_status()
+    def _finish_auto_apply(self, preset_name: str, in_use: set[str]) -> bool:
+        self.window.apply_preset_to_in_use(preset_name, in_use)
+        if self.window.ipc.connected:
+            self.window.ipc.request_device_list()
+        return False
 
-    def _on_periodic_tick(self) -> bool:
-        self._refresh_daemon_status()
-        return GLib.SOURCE_CONTINUE
+    # ----- live monitor -----
 
-    # ----- handlers do enum accel-profile (página "Configurações") -----
+    def _on_live_toggle(self, switch, _pspec) -> None:
+        if switch.get_active():
+            if not self.window.ipc.connected:
+                ok = self.window.ipc.connect()
+                if not ok:
+                    self.window.toast("Daemon não responde — está rodando?")
+                    switch.set_active(False)
+                    return
+            # Subscribe a "todos" — só recebe eventos dos mouses em uso de qualquer jeito
+            self.window.ipc.subscribe("*")
+            self.live_monitor.set_active(True)
+        else:
+            if self.window.ipc.connected:
+                self.window.ipc.unsubscribe()
+            self.live_monitor.set_active(False)
 
-    def _on_profile_setting_changed(self, settings: Gio.Settings, _key: str) -> None:
-        current = settings.get_string("accel-profile")
-        try:
-            idx = PROFILES.index(current)
-        except ValueError:
-            idx = 0
-        if self.combo.get_selected() != idx:
-            self.combo.set_selected(idx)
-
-    def _on_profile_combo_changed(self, combo: Adw.ComboRow, _pspec) -> None:
-        idx = combo.get_selected()
-        if idx >= len(PROFILES):
+    def receive_event(self, msg: dict) -> None:
+        if not self.live_monitor.active:
             return
-        new = PROFILES[idx]
-        if self.settings.get_string("accel-profile") != new:
-            self.settings.set_string("accel-profile", new)
+        # Aceita eventos de qualquer mouse em uso
+        self.live_monitor.add_sample(
+            msg.get("t", time.monotonic()),
+            msg.get("speed_in", 0.0),
+            msg.get("speed_out", 0.0),
+        )
 
-    # ----- actions do menu -----
+
+# ====================== janela ======================
+
+
+class MouseFineTuningWindow(Adw.ApplicationWindow):
+    __gtype_name__ = "MouseFineTuningWindow"
+
+    def __init__(self, app: Adw.Application) -> None:
+        super().__init__(
+            application=app,
+            title="Mouse Fine-Tuning",
+            default_width=720,
+            default_height=820,
+        )
+        self.set_size_request(560, 660)
+
+        self.settings = Gio.Settings.new(SCHEMA)
+        self.presets: list[dict] = []
+        self.active_preset_name: str | None = None
+        # devices que o daemon está interceptando agora (atualizado via IPC)
+        self.daemon_active_devices: set[str] = set()
+
+        # IPC
+        self.ipc = DaemonIPC()
+        self.ipc.on_event = self._on_ipc_event
+        self.ipc.on_device_list = self._on_ipc_device_list
+        self.ipc.on_connect_changed = self._on_ipc_connect_changed
+
+        # toast overlay
+        self._toast_overlay = Adw.ToastOverlay()
+
+        mft_common.sync_builtin_presets()
+        self.reload_presets()
+
+        # Limpa mouses ausentes/históricos do devices.json antes de tudo
+        self.cleanup_devices_config()
+        daemon_reload()
+
+        # Fallback adaptive (só se accel-profile estiver em 'default')
+        if self.settings.get_string("accel-profile") == "default":
+            self.settings.set_string("accel-profile", "adaptive")
+
+        self._build_ui()
+        self._install_actions()
+        self.refresh_all()
+        GLib.timeout_add_seconds(3, self._periodic_tick)
+
+        # Auto-apply silencioso no boot — só pra Adaptativa (sem grab).
+        # Pra curvas customizadas, o usuário precisa clicar "Aplicar curva"
+        # explicitamente (evita travamento acidental do mouse).
+        self.presets_page.schedule_auto_apply()
+
+    # ----- presets/devices state -----
+
+    def reload_presets(self, keep_selection: str | None = None) -> None:
+        self.presets = mft_common.list_all_presets()
+        if not self.active_preset_name and self.presets:
+            self.active_preset_name = self.presets[0]["name"]
+        if keep_selection:
+            self.active_preset_name = keep_selection
+        if hasattr(self, "presets_page"):
+            self.presets_page.rebuild_preset_list(select_name=self.active_preset_name)
+
+    def list_devices_with_config(self) -> list[dict]:
+        """Lista combinada: presentes (evdev) + config (devices.json). Exclui virtuais."""
+        cfg = mft_common.load_devices_config()
+        present_raw = mft_common.enumerate_present_mice()
+        present = [
+            {"id": d["id"], "name": d["name"], "path": d["path"], "present": True}
+            for d in present_raw
+        ]
+        present_ids = {d["id"] for d in present}
+
+        for entry in present:
+            cfg_entry = mft_common.find_device(cfg, entry["id"])
+            entry["config"] = cfg_entry or {}
+            entry["active"] = bool(cfg_entry and cfg_entry.get("enabled"))
+
+        result = list(present)
+        for d in cfg.get("devices", []):
+            if d["id"] not in present_ids:
+                result.append({
+                    "id": d["id"],
+                    "name": d.get("name", "(desconectado)"),
+                    "present": False,
+                    "active": False,
+                    "config": d,
+                })
+        return result
+
+    # ----- UI -----
+
+    def _build_ui(self) -> None:
+        toolbar = Adw.ToolbarView()
+
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle.new("Mouse Fine-Tuning", ""))
+        menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic")
+        menu_button.set_tooltip_text("Menu principal")
+        menu = Gio.Menu()
+        menu.append("Restaurar gsettings padrão", "win.reset_gsettings")
+        menu.append("Sobre o Mouse Fine-Tuning", "win.about")
+        menu_button.set_menu_model(menu)
+        header.pack_end(menu_button)
+
+        self.presets_page = PresetsPage(self)
+
+        toolbar.add_top_bar(header)
+        self._toast_overlay.set_child(self.presets_page.page)
+        toolbar.set_content(self._toast_overlay)
+        self.set_content(toolbar)
+
+        # primeira chamada pra popular o preset combo
+        self.reload_presets(keep_selection=self.active_preset_name)
+
+    # ----- IPC callbacks (no main loop) -----
+
+    def _on_ipc_event(self, msg: dict) -> bool:
+        self.presets_page.receive_event(msg)
+        return False
+
+    def _on_ipc_device_list(self, msg: dict) -> bool:
+        devices = msg.get("devices", [])
+        self.daemon_active_devices = {d["id"] for d in devices if d.get("active")}
+        self.presets_page.update_devices(devices)
+        return False
+
+    def _on_ipc_connect_changed(self, connected: bool) -> bool:
+        if connected:
+            self.ipc.request_device_list()
+        return False
+
+    # ----- actions / refresh -----
 
     def _install_actions(self) -> None:
-        reset = Gio.SimpleAction.new("reset", None)
-        reset.connect("activate", self._on_reset_activated)
-        self.add_action(reset)
+        a1 = Gio.SimpleAction.new("reset_gsettings", None)
+        a1.connect("activate", self._on_reset_gsettings)
+        self.add_action(a1)
 
-        reset_curve = Gio.SimpleAction.new("reset_curve", None)
-        reset_curve.connect("activate", self._on_reset_curve_activated)
-        self.add_action(reset_curve)
+        a2 = Gio.SimpleAction.new("about", None)
+        a2.connect("activate", self._on_about)
+        self.add_action(a2)
 
-        about = Gio.SimpleAction.new("about", None)
-        about.connect("activate", self._on_about_activated)
-        self.add_action(about)
-
-    def _on_reset_activated(self, _action, _param) -> None:
+    def _on_reset_gsettings(self, _action, _param) -> None:
         for key in ("speed", "accel-profile", "drag-threshold"):
             self.settings.reset(key)
 
-    def _on_reset_curve_activated(self, _action, _param) -> None:
-        self.sensitivity_adj.set_value(DEFAULT_CURVE["sensitivity"])
-        self.gain_adj.set_value(DEFAULT_CURVE["gain"])
-        self.power_adj.set_value(DEFAULT_CURVE["power"])
-        self.deadzone_adj.set_value(DEFAULT_CURVE["deadzone"])
-        self.max_mult_adj.set_value(DEFAULT_CURVE["max_multiplier"])
-        # value-changed do último set já dispara commit, mas garantimos:
-        self._commit_curve_now()
-
-    def _on_about_activated(self, _action, _param) -> None:
+    def _on_about(self, _action, _param) -> None:
         about = Adw.AboutDialog(
             application_name="Mouse Fine-Tuning",
             application_icon="input-mouse-symbolic",
             developer_name="lcf2212",
             version=APP_VERSION,
             comments=(
-                "Configurações nativas do mouse + curva de aceleração "
-                "customizada velocidade-dependente."
+                "Configurações nativas do mouse + curva de aceleração customizada "
+                "velocidade-dependente, com presets, multi-device e live monitor."
             ),
             copyright="© 2026 lcf2212",
             license_type=Gtk.License.MIT_X11,
             website="https://github.com/lcf2212dev/gnome-mouse-fine-tunning",
         )
         about.present(self)
+
+    def toast(self, text: str) -> None:
+        self._toast_overlay.add_toast(Adw.Toast.new(text))
+
+    def refresh_all(self) -> None:
+        self.presets_page.refresh_apply_status()
+        if self.ipc.connected:
+            self.ipc.request_device_list()
+
+    def _periodic_tick(self) -> bool:
+        # reconectar IPC se daemon ficou ativo agora; refrescar status
+        self.presets_page.refresh_apply_status()
+        if not self.ipc.connected and daemon_active():
+            self.ipc.connect()
+        return GLib.SOURCE_CONTINUE
+
+    # ----- aplicação automática ao mouse em uso -----
+
+    def cleanup_devices_config(self) -> None:
+        """Remove de devices.json qualquer mouse não presente no momento."""
+        cfg = mft_common.load_devices_config()
+        present_ids = {m["id"] for m in mft_common.enumerate_present_mice()}
+        before = len(cfg.get("devices", []))
+        cfg["devices"] = [d for d in cfg.get("devices", []) if d["id"] in present_ids]
+        if len(cfg["devices"]) != before:
+            mft_common.save_devices_config(cfg)
+
+    def detect_in_use_now(self, timeout: float = 1.5) -> set[str]:
+        """Combina probe direto + IDs já interceptados pelo daemon."""
+        result = set(self.daemon_active_devices)
+        probe = mft_common.probe_mouse_activity(timeout=timeout)
+        for did, in_use in probe.items():
+            if in_use:
+                result.add(did)
+        return result
+
+    def apply_preset_to_in_use(self, preset_name: str, in_use_ids: set[str]) -> int:
+        """Aplica preset aos mouses em uso.
+
+        - Adaptativa: nenhum mouse interceptado, `accel-profile=adaptive`.
+        - Custom: mouses em `in_use_ids` ficam enabled=true; `accel-profile=flat`.
+
+        O `gsettings speed` NÃO é tocado por essa função — é controlado pelo
+        slider de velocidade do app (ligado diretamente ao gsettings).
+        """
+        if mft_common.is_system_default(preset_name):
+            self.disable_curve_everywhere()
+            self.settings.set_string("accel-profile", "adaptive")
+            return 0
+
+        cfg = mft_common.load_devices_config()
+        present = {m["id"]: m["name"] for m in mft_common.enumerate_present_mice()}
+        for did in in_use_ids:
+            if did in present:
+                mft_common.upsert_device(cfg, did, present[did])
+        n = 0
+        for d in cfg.get("devices", []):
+            if d["id"] in in_use_ids:
+                d["enabled"] = True
+                d["preset"] = preset_name
+                n += 1
+            else:
+                d["enabled"] = False
+        mft_common.save_devices_config(cfg)
+        self.settings.set_string("accel-profile", "flat")
+        daemon_reload()
+        return n
+
+    def disable_curve_everywhere(self) -> None:
+        cfg = mft_common.load_devices_config()
+        for d in cfg.get("devices", []):
+            d["enabled"] = False
+        mft_common.save_devices_config(cfg)
+        daemon_reload()
 
 
 class MissingSchemaWindow(Adw.ApplicationWindow):
@@ -796,9 +1292,7 @@ class MissingSchemaWindow(Adw.ApplicationWindow):
                 icon_name="dialog-error-symbolic",
                 title="Schema do GNOME não encontrado",
                 description=(
-                    f"O schema “{SCHEMA}” não está disponível neste sistema. "
-                    "Verifique se o GNOME está instalado e se você está em uma "
-                    "sessão GNOME."
+                    f"O schema “{SCHEMA}” não está disponível neste sistema."
                 ),
             )
         )

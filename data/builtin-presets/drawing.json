@@ -1,0 +1,13 @@
+{
+  "name": "Desenho",
+  "description": "Pra edição e desenho: precisão máxima em velocidades baixas, dead-zone alta (80 px/s) pra evitar tremores, aceleração contida em movimentos rápidos.",
+  "builtin": true,
+  "order": 4,
+  "curve": {
+    "sensitivity": 0.5,
+    "gain": 1.0,
+    "power": 1.7,
+    "deadzone": 80.0,
+    "max_multiplier": 2.5
+  }
+}

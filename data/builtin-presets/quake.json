@@ -1,0 +1,13 @@
+{
+  "name": "Quake",
+  "description": "Curva quadrática clássica do Quake/CS 1.6: sem dead-zone, aceleração cresce com o quadrado da velocidade, multiplicador máximo alto pra rocket jumps.",
+  "builtin": true,
+  "order": 3,
+  "curve": {
+    "sensitivity": 0.7,
+    "gain": 2.2,
+    "power": 2.0,
+    "deadzone": 0.0,
+    "max_multiplier": 6.0
+  }
+}
